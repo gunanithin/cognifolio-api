@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # PostgreSQL — structured data (users, documents, extracted entities)
+  postgres:
+    image: postgres:16-alpine
+    container_name: cognifolio-postgres
+    environment:
+      POSTGRES_DB: cognifolio
+      POSTGRES_USER: cognifolio
+      POSTGRES_PASSWORD: cognifolio_dev_123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cognifolio"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant — vector search (semantic document search)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: cognifolio-qdrant
+    ports:
+      - "6333:6333"  # REST API
+      - "6334:6334"  # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  postgres_data:
+  qdrant_data:

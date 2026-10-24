@@ -1,0 +1,297 @@
+import json
+import logging
+import re
+from collections import Counter
+from typing import Any
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+EXTRACTION_SYSTEM_PROMPT = """You are an Enterprise Multimodal Document Intelligence Analyst.
+Analyze the provided document text (or image) with high precision and return a valid JSON object strictly matching this schema:
+{
+  "document_type": "Invoice" | "Contract" | "Financial Report" | "Tax Document" | "Policy" | "Employment Agreement" | "General Document",
+  "title": "Concise descriptive document title",
+  "summary": "Crisp executive summary in 3-5 sentences highlighting the most important findings and purpose",
+  "key_points": ["Point 1", "Point 2", "Point 3", "Point 4"],
+  "entities": {
+    "vendor_or_issuer": "string or null",
+    "client_or_recipient": "string or null",
+    "total_amount": "formatted string with currency or null",
+    "currency": "INR | USD | EUR | etc. or null",
+    "invoice_number": "string or null",
+    "effective_date": "YYYY-MM-DD or readable string or null",
+    "due_date": "YYYY-MM-DD or readable string or null"
+  },
+  "line_items": [
+    {"description": "Item description", "quantity": 1, "amount": 1000.0}
+  ],
+  "action_items": [
+    "Immediate action or deadline required"
+  ],
+  "risk_clauses": [
+    "Penalty or auto-renewal or liability clause if applicable"
+  ],
+  "charts_data": {
+    "chart_type": "pie" | "bar" | "none",
+    "title": "Cost / Item Breakdown",
+    "labels": ["Item A", "Item B"],
+    "values": [5000, 3000]
+  }
+}
+Return ONLY valid JSON with no markdown backticks or commentary.
+"""
+
+
+class GeminiDocumentAnalyzer:
+    def __init__(self):
+        self.api_key = settings.GEMINI_API_KEY
+        self.model_name = settings.GEMINI_MODEL
+        self._client = None
+
+    def _get_client(self):
+        if not self._client and self.api_key:
+            try:
+                from google import genai
+                self._client = genai.Client(api_key=self.api_key)
+            except Exception as e:
+                logger.error(f"Failed to initialize google.genai client: {e}")
+        return self._client
+
+    async def analyze_document(
+        self,
+        sanitized_text: str,
+        filename: str,
+        file_path: str = None,
+        is_scanned: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Analyzes a document using Gemini Flash. 
+        Falls back to rule-based heuristic extraction if API key is not supplied or fails.
+        """
+        client = self._get_client()
+
+        if client and self.api_key:
+            try:
+                # If it's a scanned PDF/image and file exists, we can pass file directly or text
+                prompt = (
+                    f"Document Filename: {filename}\n"
+                    f"Document Content:\n{sanitized_text[:120000]}"
+                )
+
+                response = client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config={
+                        "system_instruction": EXTRACTION_SYSTEM_PROMPT,
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json",
+                    },
+                )
+
+                raw_json = response.text.strip()
+                # Clean any markdown if present
+                if raw_json.startswith("```"):
+                    raw_json = re.sub(r"^```(?:json)?\n|\n```$", "", raw_json, flags=re.MULTILINE).strip()
+
+                parsed = json.loads(raw_json)
+                return self._normalize_result(parsed)
+
+            except Exception as e:
+                logger.warning(f"Gemini API call failed ({e}). Falling back to intelligent heuristic extraction.")
+
+        # Fallback heuristic analyzer
+        return self._heuristic_analysis(sanitized_text, filename)
+
+    def _normalize_result(self, data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "document_type": data.get("document_type") or "Document",
+            "title": data.get("title") or "Untitled Document",
+            "summary": data.get("summary") or "Document successfully processed.",
+            "key_points": data.get("key_points") or [],
+            "entities": data.get("entities") or {},
+            "line_items": data.get("line_items") or [],
+            "action_items": data.get("action_items") or [],
+            "risk_clauses": data.get("risk_clauses") or [],
+            "charts_data": data.get("charts_data") or {"chart_type": "none", "labels": [], "values": []},
+            "confidence_score": 0.95,
+        }
+
+    def _heuristic_analysis(self, text: str, filename: str) -> dict[str, Any]:
+        """
+        Dynamic heuristic extraction engine used when GEMINI_API_KEY is not configured.
+        Parses document text dynamically across any document without hardcoded static templates.
+        """
+        text_lower = text.lower()
+
+        # 1. Document Category Classification
+        doc_type = "Document"
+        if any(w in text_lower for w in ["tax invoice", "invoice no", "bill to", "subtotal", "gstin", "amount due"]):
+            doc_type = "Invoice"
+        elif any(w in text_lower for w in ["health insurance", "sum insured", "policyholder", "insurance policy", "premium details", "policy copy"]):
+            doc_type = "Policy"
+        elif any(w in text_lower for w in ["agreement", "contract", "parties", "hereby agreed", "terms and conditions"]):
+            doc_type = "Contract"
+        elif any(w in text_lower for w in ["balance sheet", "revenue", "ebitda", "profit", "quarterly", "q1", "q2", "q3", "q4"]):
+            doc_type = "Financial Report"
+        elif any(w in text_lower for w in ["guidelines", "compliance", "policy"]):
+            doc_type = "Policy"
+
+        # 2. Dynamic Duplicate Header/Footer Suppression across pages
+        raw_pages = text.split("--- [Page ")
+        line_page_counts = Counter()
+        for p in raw_pages:
+            seen_in_page = set(l.strip() for l in p.split("\n") if len(l.strip()) > 10)
+            for l in seen_in_page:
+                line_page_counts[l] += 1
+        repeated_boilerplate = set(l for l, count in line_page_counts.items() if count >= 3)
+
+        clean_lines = []
+        for l in text.split("\n"):
+            s = l.strip()
+            if len(s) > 10 and s not in repeated_boilerplate and not s.startswith("---"):
+                clean_lines.append(s)
+
+        # 3. Dynamic Currency & Total Amount Detection
+        amounts = re.findall(r"(?:₹|\$|INR|USD|EUR|GBP|€|£)\s?[\d,]+(?:\.\d{2})?", text, re.IGNORECASE)
+        currency = "USD"
+        if "₹" in text or "inr" in text_lower:
+            currency = "INR"
+        elif "€" in text or "eur" in text_lower:
+            currency = "EUR"
+        elif "£" in text or "gbp" in text_lower:
+            currency = "GBP"
+
+        # Extract numeric amounts to find highest/total amount
+        parsed_amounts = []
+        for a in amounts:
+            try:
+                num = float(re.sub(r"[^\d.]", "", a))
+                parsed_amounts.append((num, a))
+            except:
+                pass
+        
+        parsed_amounts.sort(key=lambda x: x[0], reverse=True)
+        total_amount = parsed_amounts[0][1] if parsed_amounts else (amounts[0] if amounts else None)
+
+        # 4. Dynamic Date Detection
+        dates = re.findall(
+            r"\b(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})\b",
+            text,
+            re.IGNORECASE,
+        )
+        seen_dates = set()
+        detected_dates = []
+        for d in dates:
+            if d not in seen_dates:
+                seen_dates.add(d)
+                detected_dates.append(d)
+
+        # 5. Dynamic Entities: Issuer & Recipient
+        issuer = None
+        recipient = None
+        for l in clean_lines[:15]:
+            if re.match(r"^(?:Client|Customer|Issued To|Policyholder|Bill To|Proposer|Insured Name):\s*(.+)$", l, re.IGNORECASE):
+                m = re.match(r"^(?:Client|Customer|Issued To|Policyholder|Bill To|Proposer|Insured Name):\s*(.+)$", l, re.IGNORECASE)
+                recipient = m.group(1).strip()
+            elif re.search(r"\b(?:MR|MS|MRS|DR)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", l):
+                m = re.search(r"\b(?:MR|MS|MRS|DR)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", l)
+                if not recipient:
+                    recipient = m.group(0).strip()
+            elif not issuer and re.match(r"^[A-Z][A-Za-z0-9\s,\.]{4,50}(?:Ltd|Limited|Inc|Corp|Corporation|Pvt|Company|Enterprises|Solutions)$", l):
+                issuer = l.strip()
+
+        # 6. Dynamic Table Line Items Extraction
+        line_items = []
+        seen_descs = set()
+        for l in clean_lines:
+            m = re.match(r"^([A-Za-z][A-Za-z0-9\s\(\)\/\-\.\&]{3,60}?)\s+(?:₹|\$|INR|USD|EUR)?\s?([\d,]{1,9}(?:\.\d{2})?)$", l)
+            if m:
+                desc = m.group(1).strip()
+                val_str = m.group(2).replace(",", "")
+                if len(val_str) > 8 and not re.search(r"[₹\$]", l):
+                    continue
+                if desc.lower() in seen_descs:
+                    continue
+                if any(desc.lower().startswith(skip) for skip in ["page", "tel", "call", "date", "pin", "code", "gstin", "cin", "uin", "email"]):
+                    continue
+
+                try:
+                    num_val = float(val_str)
+                    seen_descs.add(desc.lower())
+                    line_items.append({"description": desc, "quantity": 1, "amount": num_val})
+                except:
+                    pass
+
+        # Take the most relevant table rows
+        line_items = line_items[:6]
+
+        # 7. Dynamic Risk & Penalty Clauses
+        risk_keywords = [
+            "penalty", "termination", "liquidated damages", "liability", "breach", "cancellation",
+            "cancel", "interest", "forfeit", "moratorium", "exclusion", "warranty", "pre-existing",
+            "non-disclosure", "dispute", "governing law"
+        ]
+        risk_clauses = []
+        for l in clean_lines:
+            l_lower = l.lower()
+            if any(k in l_lower for k in risk_keywords) and 30 < len(l) < 220:
+                if not any(l[:25] in r for r in risk_clauses):
+                    risk_clauses.append(l)
+
+        risk_clauses = risk_clauses[:6]
+
+        # 8. Dynamic Key Points / Section Headings
+        key_points = []
+        for l in clean_lines:
+            if re.match(r"^(?:[0-9]{1,2}[\.\)]|[A-Z][\.\)]|Section|Clause|Article|Product|Certificate|Subject:)\s", l, re.IGNORECASE) and 25 < len(l) < 180:
+                if not any(l[:20] in kp for kp in key_points):
+                    key_points.append(l)
+
+        if not key_points:
+            key_points = [l for l in clean_lines if 30 < len(l) < 150][:5]
+        else:
+            key_points = key_points[:6]
+
+        # 9. Dynamic Chart Data from Line Items
+        labels = [item["description"][:24] for item in line_items if item["amount"] > 0][:5]
+        values = [item["amount"] for item in line_items if item["amount"] > 0][:5]
+
+        # 10. Dynamic Executive Summary
+        summary = (
+            f"Analyzed {doc_type} '{filename}'. "
+            f"Detected {len(clean_lines)} content segments"
+            + (f" with a total identified figure of {total_amount}." if total_amount else ".")
+            + (f" Primary parties: {issuer or 'unspecified issuer'} and {recipient}." if recipient else "")
+            + f" Extracted {len(key_points)} key findings and {len(line_items)} structured table rows."
+        )
+
+        return {
+            "document_type": doc_type,
+            "title": filename.replace(".pdf", "").replace("_", " ").title(),
+            "summary": summary,
+            "key_points": key_points,
+            "entities": {
+                "vendor_or_issuer": issuer,
+                "client_or_recipient": recipient,
+                "total_amount": total_amount,
+                "currency": currency,
+                "detected_dates": detected_dates[:3],
+            },
+            "line_items": line_items,
+            "action_items": [
+                f"Review {doc_type} terms and verify {len(line_items)} line items",
+                "Ensure compliance with risk and policy clauses before retention deadline"
+            ],
+            "risk_clauses": risk_clauses,
+            "charts_data": {
+                "chart_type": "pie" if len(values) > 1 else "none",
+                "title": f"Cost Distribution ({filename})",
+                "labels": labels,
+                "values": values,
+            },
+            "confidence_score": 0.92,
+        }
+
+
+gemini_analyzer = GeminiDocumentAnalyzer()

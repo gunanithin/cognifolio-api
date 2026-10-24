@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Sensitive Environment Variables & Secrets
+.env
+*.env.local
+
+# Uploaded Files & Temporary Storage
+uploads/
+scratch/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Databases & Caches
+qdrant_storage/
+*.db
+*.sqlite3
+.pytest_cache/
+.coverage
+htmlcov/
