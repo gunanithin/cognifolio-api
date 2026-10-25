@@ -45,12 +45,18 @@ def get_dashboard_stats(
     recent_items = []
     for d in recent_docs:
         insight = d.insights
+        uploaded_str = ""
+        if d.uploaded_at:
+            try:
+                uploaded_str = d.uploaded_at.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                uploaded_str = str(d.uploaded_at)
         recent_items.append({
             "id": str(d.id),
             "filename": d.original_filename,
             "document_type": insight.document_type if insight else d.file_type,
             "status": d.status,
-            "uploaded_at": d.uploaded_at.strftime("%Y-%m-%d %H:%M"),
+            "uploaded_at": uploaded_str,
             "summary": (insight.summary[:140] + "...") if (insight and insight.summary) else "Processing...",
         })
 
@@ -62,9 +68,16 @@ def get_dashboard_stats(
     all_insights = insights_query.all()
     vendor_spending = {}
     for ins in all_insights:
-        if ins.entities and isinstance(ins.entities, dict):
-            vendor = ins.entities.get("vendor_or_issuer")
-            amt_str = ins.entities.get("total_amount")
+        entities = ins.entities
+        if isinstance(entities, str):
+            try:
+                import json
+                entities = json.loads(entities)
+            except Exception:
+                entities = {}
+        if entities and isinstance(entities, dict):
+            vendor = entities.get("vendor_or_issuer")
+            amt_str = entities.get("total_amount")
             if vendor and amt_str:
                 clean_num = re.sub(r"[^\d.]", "", str(amt_str))
                 try:
