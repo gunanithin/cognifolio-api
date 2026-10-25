@@ -2,31 +2,40 @@ import io
 import csv
 import json
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from typing import Optional, Dict
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
-
 from app.database import get_db
 from app.models.entities import AuditLog, Document, User
-from app.services.audit import log_audit_event, get_default_analyst
+from app.services.audit import log_audit_event
 from app.services.redactor import redactor
+from app.core import get_current_user
 
 router = APIRouter(prefix="/compliance", tags=["Compliance & Audit"])
 
 
 @router.get("/stats")
-def get_compliance_stats(db: Session = Depends(get_db)):
+def get_compliance_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Returns aggregated enterprise compliance metrics, PII discovery totals,
-    and audit trail activity summaries for SOC2 and GDPR reporting.
+    and audit trail activity summaries scoped to the authenticated caller.
     """
-    total_docs = db.query(Document).count()
-    total_audits = db.query(AuditLog).count()
-    all_logs = db.query(AuditLog).all()
+    doc_query = db.query(Document)
+    audit_query = db.query(AuditLog)
 
-    # Aggregate PII detections across all logs
+    if current_user.role != "admin":
+        doc_query = doc_query.filter(Document.user_id == current_user.id)
+        audit_query = audit_query.filter(AuditLog.user_id == current_user.id)
+
+    total_docs = doc_query.count()
+    total_audits = audit_query.count()
+    all_logs = audit_query.all()
+
+    # Aggregate PII detections across scoped logs
     pii_counts: Dict[str, int] = {
         "aadhaar": 0,
         "pan": 0,
@@ -52,9 +61,6 @@ def get_compliance_stats(db: Session = Depends(get_db)):
                     pii_counts[k] = pii_counts.get(k, 0) + count
 
     total_pii_masked = sum(pii_counts.values())
-
-    # Compliance posture calculation
-    # Base 95% + 4% for active audit trail + 1% for zero unmasked leaks
     compliance_score = 99.2 if total_audits > 0 else 95.0
 
     return {
@@ -77,23 +83,26 @@ def get_compliance_stats(db: Session = Depends(get_db)):
 
 @router.get("/audit-logs")
 def list_audit_logs(
-    action: Optional[str] = Query(None, description="Filter by event action (e.g. uploaded, viewed, searched)"),
+    action: Optional[str] = Query(None, description="Filter by event action"),
     search: Optional[str] = Query(None, description="Search term in target or metadata"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Returns paginated, searchable immutable audit trail events.
+    Returns paginated, searchable immutable audit trail events strictly scoped to caller.
     """
     query = db.query(AuditLog)
+
+    if current_user.role != "admin":
+        query = query.filter(AuditLog.user_id == current_user.id)
 
     if action and action != "all":
         query = query.filter(AuditLog.action == action)
 
-    logs = query.order_by(desc(AuditLog.created_at)).all()
+    logs = query.order_by(AuditLog.created_at.desc()).all()
 
-    # Search filter in-memory if search parameter is provided
     if search:
         s_lower = search.lower()
         filtered = []
@@ -117,8 +126,8 @@ def list_audit_logs(
             "target_type": l.target_type,
             "target_id": str(l.target_id) if l.target_id else None,
             "user_id": str(l.user_id) if l.user_id else None,
-            "actor_name": meta.get("actor_name", "Demo Analyst"),
-            "actor_email": meta.get("actor_email", "demo@cognifolio.ai"),
+            "actor_name": meta.get("actor_name", current_user.name),
+            "actor_email": meta.get("actor_email", current_user.email),
             "ip_address": meta.get("ip_address", "127.0.0.1"),
             "metadata": meta,
             "created_at": l.created_at.isoformat() if l.created_at else None,
@@ -133,23 +142,30 @@ def list_audit_logs(
 
 
 @router.post("/redact/{document_id}")
-def trigger_document_redaction(document_id: str, db: Session = Depends(get_db)):
+def trigger_document_redaction(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
-    Explicitly triggers physical PDF redaction for a document, generating the
-    sanitized copy and recording an immutable audit event.
+    Explicitly triggers physical PDF redaction for a document owned by the caller.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
+    query = db.query(Document).filter(Document.id == document_id)
+    if current_user.role != "admin":
+        query = query.filter(Document.user_id == current_user.id)
+
+    doc = query.first()
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
 
     redacted_path = redactor.get_or_create_redacted_pdf(doc.id, doc.file_path)
 
-    # Log audit event
     log_audit_event(
         db=db,
         action="redacted",
         target_type="document",
-        target_id=doc.id,
+        target_id=str(doc.id),
+        user_id=str(current_user.id),
         metadata={
             "filename": doc.original_filename,
             "redacted_file": redacted_path,
@@ -170,19 +186,24 @@ def trigger_document_redaction(document_id: str, db: Session = Depends(get_db)):
 def export_audit_trail(
     format: str = Query("csv", pattern="^(csv|json)$"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Generates a cryptographically signed audit export for external regulatory reviews.
+    Generates an authenticated audit export for regulatory and compliance review.
     """
-    logs = db.query(AuditLog).order_by(desc(AuditLog.created_at)).all()
+    query = db.query(AuditLog).order_by(AuditLog.created_at.desc())
+    if current_user.role != "admin":
+        query = query.filter(AuditLog.user_id == current_user.id)
+
+    logs = query.all()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-    # Record export audit action
     log_audit_event(
         db=db,
         action="exported",
         target_type="compliance_report",
         target_id=None,
+        user_id=str(current_user.id),
         metadata={"format": format, "total_records": len(logs)},
     )
 
@@ -228,7 +249,7 @@ def export_audit_trail(
             l.action,
             l.target_type or "system",
             str(l.target_id or "N/A"),
-            meta.get("actor_email", "demo@cognifolio.ai"),
+            meta.get("actor_email", current_user.email),
             meta.get("ip_address", "127.0.0.1"),
             json.dumps(meta),
         ])

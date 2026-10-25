@@ -32,3 +32,4 @@ qdrant_storage/
 .pytest_cache/
 .coverage
 htmlcov/
+.vscode/

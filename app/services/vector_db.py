@@ -1,7 +1,7 @@
 import logging
 import math
 import re
-from typing import Any
+from typing import Any, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from app.config import settings
@@ -39,6 +39,17 @@ class VectorDBService:
                     ),
                 )
                 logger.info(f"Created Qdrant collection: {self.collection_name}")
+
+            # Ensure payload indices for tenant filtering
+            for field in ["user_id", "document_id", "doc_type"]:
+                try:
+                    self._client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name=field,
+                        field_schema=qmodels.PayloadSchemaType.KEYWORD,
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"Could not initialize Qdrant client ({e}). Will use in-memory fallback.")
             self._client = QdrantClient(":memory:")
@@ -112,9 +123,9 @@ class VectorDBService:
         self,
         query: str,
         limit: int = 10,
-        user_id: str = None,
-        org_id: str = None,
-        doc_type: str = None,
+        user_id: Optional[str] = None,
+        org_id: Optional[str] = None,
+        doc_type: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """
         Semantic vector search with tenant/user metadata filtering.

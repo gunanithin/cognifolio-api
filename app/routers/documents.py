@@ -3,12 +3,14 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+
 from app.config import settings
 from app.database import get_db
-from app.models.entities import Document, DocumentInsight, User, AuditLog
+from app.models.entities import Document, DocumentInsight, User
 from app.schemas.document import DocumentResponse, DocumentListResponse
 from app.schemas.chat import DocumentChatRequest, DocumentChatResponse
 from app.schemas.comparison import DocumentCompareRequest, DocumentCompareResponse
@@ -17,23 +19,38 @@ from app.services.redactor import redactor
 from app.services.gemini import gemini_analyzer
 from app.services.vector_db import vector_service
 from app.services.audit import log_audit_event
+from app.core import get_current_user, get_optional_user, decode_access_token
 
-router = APIRouter(prefix="/documents", tags=["Documents"])
+router = APIRouter(prefix="/documents", tags=["Documents & Multimodal Intelligence"])
 
 
-def get_or_create_default_user(db: Session) -> User:
-    user = db.query(User).first()
-    if not user:
-        user = User(
-            id=str(uuid.uuid4()),
-            email="demo@cognifolio.ai",
-            name="Demo Analyst",
-            password_hash="mock",
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return user
+def resolve_file_user(
+    token: Optional[str],
+    current_user: Optional[User],
+    db: Session,
+) -> User:
+    """
+    Enterprise helper for file streaming endpoints.
+    Resolves caller via Bearer header or query token (essential for browser PDF iframe/window plugins).
+    """
+    if current_user:
+        return current_user
+    if token:
+        try:
+            payload = decode_access_token(token)
+            user_id = payload.get("sub")
+            if user_id:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    return user
+        except Exception:
+            pass
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required to view document file.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 @router.post("/upload", response_model=DocumentResponse)
@@ -41,42 +58,42 @@ async def upload_document(
     file: UploadFile = File(...),
     retention_days: int = Form(default=90),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Upload a document, extract content, redact PII, process with Gemini Flash,
-    and index in both relational DB and Qdrant vector database.
+    Secure document ingestion strictly scoped to the authenticated caller.
+    Extracts text, redacts PII, runs Gemini 3.5 Flash analysis, and indexes in Qdrant with tenant payload.
     """
-    ext = Path(file.filename).suffix.lower().replace(".", "")
+    safe_filename = file.filename or "uploaded_document"
+    ext = Path(safe_filename).suffix.lower().replace(".", "")
     if ext not in settings.allowed_extensions_list:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file format '{ext}'. Allowed: {settings.ALLOWED_EXTENSIONS}",
         )
 
-    user = get_or_create_default_user(db)
     doc_id = str(uuid.uuid4())
-    stored_filename = f"{doc_id}_{file.filename}"
+    stored_filename = f"{doc_id}_{safe_filename}"
     file_path = os.path.join(settings.UPLOAD_DIR, stored_filename)
 
-    # Save uploaded file
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+    # Save physical file
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
     file_size = os.path.getsize(file_path)
 
-    # Create initial document record
+    # Scoped strictly to current_user
     doc = Document(
         id=doc_id,
-        user_id=user.id,
+        user_id=current_user.id,
         filename=stored_filename,
         original_filename=file.filename,
         file_path=file_path,
         file_size_bytes=file_size,
         file_type=ext,
         mime_type=file.content_type,
+        page_count=1,
         status="processing",
         retention_days=retention_days,
     )
@@ -100,10 +117,10 @@ async def upload_document(
         except Exception:
             pass
 
-    # 3. AI Analysis (Gemini Flash)
+    # 3. AI Analysis (Gemini 3.5 Flash)
     ai_insights = await gemini_analyzer.analyze_document(
         sanitized_text=sanitized_text,
-        filename=file.filename,
+        filename=safe_filename,
         file_path=file_path,
         is_scanned=is_scanned,
     )
@@ -133,7 +150,7 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
 
-    # 5. Vector indexing in Qdrant
+    # 5. Vector indexing in Qdrant with tenant isolation
     searchable_blob = f"{ai_insights['title']}\n{ai_insights['summary']}\n{' '.join(ai_insights['key_points'])}\n{sanitized_text[:4000]}"
     vector_service.upsert_document(
         doc_id=str(doc.id),
@@ -142,7 +159,7 @@ async def upload_document(
             "document_id": str(doc.id),
             "filename": doc.original_filename,
             "document_type": ai_insights["document_type"],
-            "user_id": str(user.id),
+            "user_id": str(current_user.id),
             "title": ai_insights["title"],
             "summary": ai_insights["summary"][:250],
             "uploaded_at": doc.uploaded_at.isoformat(),
@@ -155,7 +172,7 @@ async def upload_document(
         action="uploaded",
         target_type="document",
         target_id=str(doc.id),
-        user_id=str(user.id),
+        user_id=str(current_user.id),
         metadata={
             "filename": file.filename,
             "pii_redacted": pii_stats,
@@ -171,23 +188,40 @@ async def upload_document(
 async def compare_documents(
     request: DocumentCompareRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Automated redline diff comparison between two documents (Doc A vs Doc B).
-    Returns added, removed, and modified clauses, financial deltas, and risk changes.
+    Strictly verifies ownership: both documents must belong to the caller.
     """
-    doc_a = db.query(Document).filter(Document.id == request.base_document_id).first()
-    if not doc_a:
-        raise HTTPException(status_code=404, detail="Base document (Doc A) not found.")
+    doc_a_query = db.query(Document).filter(Document.id == request.base_document_id)
+    doc_b_query = db.query(Document).filter(Document.id == request.target_document_id)
 
-    doc_b = db.query(Document).filter(Document.id == request.target_document_id).first()
+    if current_user.role != "admin":
+        doc_a_query = doc_a_query.filter(Document.user_id == current_user.id)
+        doc_b_query = doc_b_query.filter(Document.user_id == current_user.id)
+
+    doc_a = doc_a_query.first()
+    if not doc_a:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Base document (Doc A) not found or access denied.",
+        )
+
+    doc_b = doc_b_query.first()
     if not doc_b:
-        raise HTTPException(status_code=404, detail="Target document (Doc B) not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Target document (Doc B) not found or access denied.",
+        )
 
     insight_a = doc_a.insights
     insight_b = doc_b.insights
     if not insight_a or not insight_b:
-        raise HTTPException(status_code=400, detail="One or both documents are still processing insights.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="One or both documents are still processing insights.",
+        )
 
     insights_data_a = {
         "entities": insight_a.entities or {},
@@ -216,7 +250,7 @@ async def compare_documents(
         doc_b_summary=insight_b.summary or "",
         doc_b_text=raw_text_b,
         doc_b_insights=insights_data_b,
-        focus_aspects=request.focus_aspects,
+        focus_aspects=request.focus_aspects or [],
     )
 
     # Log immutable audit event
@@ -225,7 +259,7 @@ async def compare_documents(
         action="document_comparison",
         target_type="document_pair",
         target_id=str(doc_a.id),
-        user_id=str(doc_a.user_id),
+        user_id=str(current_user.id),
         metadata={
             "doc_a_filename": doc_a.original_filename,
             "doc_b_id": str(doc_b.id),
@@ -251,12 +285,20 @@ async def compare_documents(
 
 
 @router.get("", response_model=DocumentListResponse)
+@router.get("/", response_model=DocumentListResponse)
 def list_documents(
     doc_type: str = Query(None),
     status: str = Query(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    """
+    Lists indexed documents strictly scoped to the active user.
+    """
     query = db.query(Document)
+    if current_user.role != "admin":
+        query = query.filter(Document.user_id == current_user.id)
+
     if status:
         query = query.filter(Document.status == status)
     if doc_type:
@@ -267,18 +309,43 @@ def list_documents(
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
-def get_document(document_id: str, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == document_id).first()
+def get_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Retrieves document metadata ensuring tenant ownership.
+    """
+    query = db.query(Document).filter(Document.id == document_id)
+    if current_user.role != "admin":
+        query = query.filter(Document.user_id == current_user.id)
+
+    doc = query.first()
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
     return doc
 
 
 @router.get("/{document_id}/file")
-def get_document_file(document_id: str, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == document_id).first()
+def get_document_file(
+    document_id: str,
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    """
+    Streams original document file. Resolves authentication via header or ?token= param.
+    """
+    caller = resolve_file_user(token=token, current_user=current_user, db=db)
+
+    query = db.query(Document).filter(Document.id == document_id)
+    if caller.role != "admin":
+        query = query.filter(Document.user_id == caller.id)
+
+    doc = query.first()
     if not doc or not os.path.exists(doc.file_path):
-        raise HTTPException(status_code=404, detail="File not found on storage")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on storage.")
 
     # Record view audit trail
     log_audit_event(
@@ -286,7 +353,7 @@ def get_document_file(document_id: str, db: Session = Depends(get_db)):
         action="viewed",
         target_type="document",
         target_id=str(doc.id),
-        user_id=str(doc.user_id),
+        user_id=str(caller.id),
         metadata={"filename": doc.original_filename, "mime_type": doc.mime_type},
     )
 
@@ -298,17 +365,28 @@ def get_document_file(document_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{document_id}/redacted-file")
-def get_redacted_document_file(document_id: str, db: Session = Depends(get_db)):
+def get_redacted_document_file(
+    document_id: str,
+    token: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
     """
     Returns the physically sanitized, blacked-out redacted PDF for compliance and secure sharing.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
+    caller = resolve_file_user(token=token, current_user=current_user, db=db)
+
+    query = db.query(Document).filter(Document.id == document_id)
+    if caller.role != "admin":
+        query = query.filter(Document.user_id == caller.id)
+
+    doc = query.first()
     if not doc or not os.path.exists(doc.file_path):
-        raise HTTPException(status_code=404, detail="Source document not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source document not found.")
 
     redacted_path = redactor.get_or_create_redacted_pdf(doc.id, doc.file_path)
     if not os.path.exists(redacted_path):
-        raise HTTPException(status_code=500, detail="Failed to locate or generate redacted document")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to locate or generate redacted document.")
 
     # Record audit trail
     log_audit_event(
@@ -316,7 +394,7 @@ def get_redacted_document_file(document_id: str, db: Session = Depends(get_db)):
         action="viewed_redacted",
         target_type="document",
         target_id=str(doc.id),
-        user_id=str(doc.user_id),
+        user_id=str(caller.id),
         metadata={
             "filename": doc.original_filename,
             "redacted_filename": os.path.basename(redacted_path),
@@ -335,9 +413,19 @@ def get_redacted_document_file(document_id: str, db: Session = Depends(get_db)):
 
 @router.delete("/{document_id}")
 @router.delete("/{document_id}/")
-def delete_document(document_id: str, db: Session = Depends(get_db)):
+def delete_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Idempotent deletion scoped strictly to the caller's documents.
+    """
     try:
-        doc = db.query(Document).filter(Document.id == document_id).first()
+        query = db.query(Document).filter(Document.id == document_id)
+        if current_user.role != "admin":
+            query = query.filter(Document.user_id == current_user.id)
+        doc = query.first()
     except Exception:
         db.rollback()
         doc = None
@@ -369,7 +457,7 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
         action="deleted",
         target_type="document",
         target_id=str(doc.id),
-        user_id=str(doc.user_id),
+        user_id=str(current_user.id),
         metadata={"filename": doc.original_filename, "purged": True},
     )
 
@@ -384,18 +472,23 @@ async def chat_with_document(
     document_id: str,
     request: DocumentChatRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Conversational RAG assistant grounded strictly in the target document.
-    Returns answers with clickable citations that navigate to the exact PDF coordinates.
+    Enforces tenant access verification.
     """
-    doc = db.query(Document).filter(Document.id == document_id).first()
+    query = db.query(Document).filter(Document.id == document_id)
+    if current_user.role != "admin":
+        query = query.filter(Document.user_id == current_user.id)
+
+    doc = query.first()
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
 
     insight = doc.insights
     if not insight:
-        raise HTTPException(status_code=400, detail="Document insights not available yet.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Document insights not available yet.")
 
     insights_data = {
         "entities": insight.entities or {},
@@ -407,35 +500,32 @@ async def chat_with_document(
     raw_text = insight.raw_extracted_text or insight.summary or ""
 
     chat_result = await gemini_analyzer.chat_with_document(
-        document_title=insight.title or doc.original_filename,
-        document_type=insight.document_type or "Document",
-        summary=insight.summary or "",
+        document_title=str(insight.title or doc.original_filename),
+        document_type=str(insight.document_type or "Document"),
+        summary=str(insight.summary or ""),
         raw_text=raw_text,
         insights_data=insights_data,
         message=request.message,
         conversation_history=request.conversation_history,
     )
 
-    # Log immutable audit event for enterprise security
+    # Log audit event
     log_audit_event(
         db=db,
         action="chat_query",
         target_type="document",
         target_id=str(doc.id),
-        user_id=str(doc.user_id),
+        user_id=str(current_user.id),
         metadata={
-            "filename": doc.original_filename,
-            "query": request.message[:200],
+            "query": request.message,
+            "filename": str(doc.original_filename),
             "citations_returned": len(chat_result.get("citations", [])),
         },
     )
 
     return DocumentChatResponse(
         document_id=str(doc.id),
-        reply=chat_result["reply"],
-        citations=chat_result["citations"],
-        suggested_followups=chat_result["suggested_followups"],
+        reply=chat_result.get("reply", "No response generated."),
+        citations=chat_result.get("citations", []),
+        suggested_followups=chat_result.get("suggested_followups", []),
     )
-
-
-

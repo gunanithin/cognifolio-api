@@ -1,23 +1,31 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models.entities import Document, DocumentInsight
+from app.models.entities import Document, DocumentInsight, User
 from app.schemas.search import SearchRequest, SearchResponse, SearchResultItem
 from app.services.vector_db import vector_service
 from app.services.audit import log_audit_event
+from app.core import get_current_user
 
 router = APIRouter(prefix="/search", tags=["Semantic Search"])
 
 
 @router.post("", response_model=SearchResponse)
-def semantic_search(request: SearchRequest, db: Session = Depends(get_db)):
+def semantic_search(
+    request: SearchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
-    Executes semantic vector search across all indexed document embeddings
-    using natural language queries, with hybrid fallback to database metadata.
+    Executes semantic vector search strictly scoped to the active user's documents.
+    Prevents cross-tenant vector data leakage.
     """
+    scoped_user_id = None if current_user.role == "admin" else str(current_user.id)
+
     raw_matches = vector_service.search(
         query=request.query,
         limit=request.limit,
+        user_id=scoped_user_id,
         doc_type=request.document_type,
     )
 
@@ -25,14 +33,13 @@ def semantic_search(request: SearchRequest, db: Session = Depends(get_db)):
     score_map = {m["document_id"]: m["score"] for m in raw_matches}
 
     # Fetch corresponding relational documents and insights
-    docs = (
-        db.query(Document)
-        .filter(Document.id.in_(doc_ids))
-        .all()
-    ) if doc_ids else []
+    query = db.query(Document).filter(Document.id.in_(doc_ids))
+    if current_user.role != "admin":
+        query = query.filter(Document.user_id == current_user.id)
+
+    docs = query.all() if doc_ids else []
 
     results = []
-    # Retain the ranking returned by the vector search
     doc_dict = {d.id: d for d in docs}
 
     for match_id in doc_ids:
@@ -56,10 +63,10 @@ def semantic_search(request: SearchRequest, db: Session = Depends(get_db)):
             )
         )
 
-    # If vector search returned 0 (e.g. fresh DB before many vectors), try fallback keyword search
+    # Fallback keyword search strictly scoped to current user
     if not results and request.query.strip():
         kw = f"%{request.query.strip()}%"
-        fallback_docs = (
+        fallback_query = (
             db.query(Document)
             .join(DocumentInsight, isouter=True)
             .filter(
@@ -67,9 +74,12 @@ def semantic_search(request: SearchRequest, db: Session = Depends(get_db)):
                 | (DocumentInsight.summary.ilike(kw))
                 | (DocumentInsight.raw_extracted_text.ilike(kw))
             )
-            .limit(request.limit)
-            .all()
         )
+        if current_user.role != "admin":
+            fallback_query = fallback_query.filter(Document.user_id == current_user.id)
+
+        fallback_docs = fallback_query.limit(request.limit).all()
+
         for doc in fallback_docs:
             insight = doc.insights
             results.append(
@@ -93,6 +103,7 @@ def semantic_search(request: SearchRequest, db: Session = Depends(get_db)):
         action="searched",
         target_type="search_query",
         target_id=None,
+        user_id=str(current_user.id),
         metadata={
             "query": request.query,
             "document_type_filter": request.document_type,

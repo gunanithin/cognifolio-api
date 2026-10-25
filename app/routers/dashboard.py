@@ -1,35 +1,46 @@
+import re
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db
-from app.models.entities import Document, DocumentInsight
+from app.models.entities import Document, DocumentInsight, User
+from app.core import get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
 @router.get("/stats")
-def get_dashboard_stats(db: Session = Depends(get_db)):
+def get_dashboard_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
-    Returns aggregated metrics and charts dataset across all indexed enterprise documents.
+    Returns aggregated metrics and charts dataset scoped strictly to the authenticated user.
     """
-    total_docs = db.query(func.count(Document.id)).scalar() or 0
-    ready_docs = db.query(func.count(Document.id)).filter(Document.status == "ready").scalar() or 0
+    doc_query = db.query(Document)
+    if current_user.role != "admin":
+        doc_query = doc_query.filter(Document.user_id == current_user.id)
 
-    # Aggregate by document type
-    type_counts = (
+    total_docs = doc_query.count()
+    ready_docs = doc_query.filter(Document.status == "ready").count()
+
+    # Aggregate by document type for current user
+    type_query = (
         db.query(DocumentInsight.document_type, func.count(DocumentInsight.id))
-        .group_by(DocumentInsight.document_type)
-        .all()
+        .join(Document, Document.id == DocumentInsight.document_id)
     )
+    if current_user.role != "admin":
+        type_query = type_query.filter(Document.user_id == current_user.id)
+
+    type_counts = type_query.group_by(DocumentInsight.document_type).all()
     doc_types_breakdown = {t: c for t, c in type_counts if t}
 
-    # Aggregate recent documents
-    recent_docs = (
-        db.query(Document)
-        .order_by(Document.uploaded_at.desc())
-        .limit(5)
-        .all()
-    )
+    # Aggregate recent documents for current user
+    recent_query = db.query(Document)
+    if current_user.role != "admin":
+        recent_query = recent_query.filter(Document.user_id == current_user.id)
+
+    recent_docs = recent_query.order_by(Document.uploaded_at.desc()).limit(5).all()
 
     recent_items = []
     for d in recent_docs:
@@ -43,16 +54,18 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
             "summary": (insight.summary[:140] + "...") if (insight and insight.summary) else "Processing...",
         })
 
-    # Auto-compile vendor/category chart data from all invoices & contracts
-    all_insights = db.query(DocumentInsight).all()
+    # Auto-compile vendor/category chart data from invoices & contracts belonging to user
+    insights_query = db.query(DocumentInsight).join(Document, Document.id == DocumentInsight.document_id)
+    if current_user.role != "admin":
+        insights_query = insights_query.filter(Document.user_id == current_user.id)
+
+    all_insights = insights_query.all()
     vendor_spending = {}
     for ins in all_insights:
         if ins.entities and isinstance(ins.entities, dict):
             vendor = ins.entities.get("vendor_or_issuer")
             amt_str = ins.entities.get("total_amount")
             if vendor and amt_str:
-                # Basic numeric parsing
-                import re
                 clean_num = re.sub(r"[^\d.]", "", str(amt_str))
                 try:
                     val = float(clean_num)
@@ -68,12 +81,12 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
         },
         "charts": {
             "by_type": {
-                "labels": list(doc_types_breakdown.keys()) or ["No Data"],
-                "values": list(doc_types_breakdown.values()) or [0],
+                "labels": list(doc_types_breakdown.keys()),
+                "data": list(doc_types_breakdown.values()),
             },
-            "by_vendor": {
-                "labels": list(vendor_spending.keys()) or ["Sample Vendor"],
-                "values": list(vendor_spending.values()) or [1000],
+            "vendor_breakdown": {
+                "labels": list(vendor_spending.keys()),
+                "data": [round(v, 2) for v in vendor_spending.values()],
             },
         },
         "recent_documents": recent_items,

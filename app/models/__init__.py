@@ -1,3 +1,3 @@
-from app.models.entities import User, Organization, Document, DocumentInsight, AuditLog
+from app.models.entities import Base, User, Document, DocumentInsight, AuditLog
 
-__all__ = ["User", "Organization", "Document", "DocumentInsight", "AuditLog"]
+__all__ = ["Base", "User", "Document", "DocumentInsight", "AuditLog"]

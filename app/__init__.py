@@ -1,0 +1,3 @@
+"""
+Cognifolio API package.
+"""

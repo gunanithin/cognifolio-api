@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import engine, Base
-from app.routers import documents, search, dashboard, compliance
+from app.routers import documents, search, dashboard, compliance, auth
 
 
 @asynccontextmanager
@@ -32,6 +32,7 @@ app.add_middleware(
 
 # Register versioned routers
 api_v1 = FastAPI()
+api_v1.include_router(auth.router)
 api_v1.include_router(documents.router)
 api_v1.include_router(search.router)
 api_v1.include_router(dashboard.router)
