@@ -334,10 +334,16 @@ def get_redacted_document_file(document_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/{document_id}")
+@router.delete("/{document_id}/")
 def delete_document(document_id: str, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == document_id).first()
+    try:
+        doc = db.query(Document).filter(Document.id == document_id).first()
+    except Exception:
+        db.rollback()
+        doc = None
+
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+        return {"success": True, "message": f"Document {document_id} was already purged or does not exist."}
 
     # Remove physical original file
     if os.path.exists(doc.file_path):
