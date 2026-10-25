@@ -3,30 +3,31 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, status
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core import decode_access_token, get_current_user, get_optional_user
 from app.database import get_db
 from app.models.entities import Document, DocumentInsight, User
-from app.schemas.document import DocumentResponse, DocumentListResponse
 from app.schemas.chat import DocumentChatRequest, DocumentChatResponse
 from app.schemas.comparison import DocumentCompareRequest, DocumentCompareResponse
+from app.schemas.document import DocumentListResponse, DocumentResponse
+from app.services.audit import log_audit_event
+from app.services.gemini import gemini_analyzer
 from app.services.pdf_extractor import extractor
 from app.services.redactor import redactor
-from app.services.gemini import gemini_analyzer
 from app.services.vector_db import vector_service
-from app.services.audit import log_audit_event
-from app.core import get_current_user, get_optional_user, decode_access_token
 
 router = APIRouter(prefix="/documents", tags=["Documents & Multimodal Intelligence"])
 
 
 def resolve_file_user(
-    token: Optional[str],
-    current_user: Optional[User],
+    token: str | None,
+    current_user: User | None,
     db: Session,
 ) -> User:
     """
@@ -55,10 +56,10 @@ def resolve_file_user(
 
 @router.post("/upload", response_model=DocumentResponse)
 async def upload_document(
-    file: UploadFile = File(...),
-    retention_days: int = Form(default=90),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    file: Annotated[UploadFile, File(...)],
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    retention_days: Annotated[int, Form()] = 90,
 ):
     """
     Secure document ingestion strictly scoped to the authenticated caller.
@@ -88,7 +89,7 @@ async def upload_document(
         id=doc_id,
         user_id=current_user.id,
         filename=stored_filename,
-        original_filename=file.filename,
+        original_filename=safe_filename,
         file_path=file_path,
         file_size_bytes=file_size,
         file_type=ext,
@@ -112,7 +113,7 @@ async def upload_document(
 
     # Pre-generate physically redacted file (PDF, Image, or Text)
     try:
-        redactor.get_or_create_redacted_file(doc.id, file_path)
+        redactor.get_or_create_redacted_file(doc_id, file_path)
     except Exception:
         pass
 
@@ -168,7 +169,7 @@ async def upload_document(
             "user_id": str(current_user.id),
             "title": ai_insights["title"],
             "summary": ai_insights["summary"][:250],
-            "uploaded_at": doc.uploaded_at.isoformat(),
+            "uploaded_at": doc.uploaded_at.isoformat() if doc.uploaded_at else "",
         },
     )
 
@@ -193,8 +194,8 @@ async def upload_document(
 @router.post("/compare", response_model=DocumentCompareResponse)
 async def compare_documents(
     request: DocumentCompareRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
 ):
     """
     Automated redline diff comparison between two documents (Doc A vs Doc B).
@@ -246,14 +247,14 @@ async def compare_documents(
     raw_text_b = insight_b.raw_extracted_text or insight_b.summary or ""
 
     compare_result = await gemini_analyzer.compare_documents(
-        doc_a_title=insight_a.title or doc_a.original_filename,
-        doc_a_type=insight_a.document_type or "Document",
-        doc_a_summary=insight_a.summary or "",
+        doc_a_title=str(insight_a.title or doc_a.original_filename or "Document A"),
+        doc_a_type=str(insight_a.document_type or "Document"),
+        doc_a_summary=str(insight_a.summary or ""),
         doc_a_text=raw_text_a,
         doc_a_insights=insights_data_a,
-        doc_b_title=insight_b.title or doc_b.original_filename,
-        doc_b_type=insight_b.document_type or "Document",
-        doc_b_summary=insight_b.summary or "",
+        doc_b_title=str(insight_b.title or doc_b.original_filename or "Document B"),
+        doc_b_type=str(insight_b.document_type or "Document"),
+        doc_b_summary=str(insight_b.summary or ""),
         doc_b_text=raw_text_b,
         doc_b_insights=insights_data_b,
         focus_aspects=request.focus_aspects or [],
@@ -278,12 +279,12 @@ async def compare_documents(
 
     return DocumentCompareResponse(
         base_document_id=str(doc_a.id),
-        base_document_title=insight_a.title or doc_a.original_filename,
-        base_document_type=insight_a.document_type or "Document",
+        base_document_title=str(insight_a.title or doc_a.original_filename or "Document A"),
+        base_document_type=str(insight_a.document_type or "Document"),
         target_document_id=str(doc_b.id),
-        target_document_title=insight_b.title or doc_b.original_filename,
-        target_document_type=insight_b.document_type or "Document",
-        executive_summary=compare_result.get("executive_summary", ""),
+        target_document_title=str(insight_b.title or doc_b.original_filename or "Document B"),
+        target_document_type=str(insight_b.document_type or "Document"),
+        executive_summary=str(compare_result.get("executive_summary", "")),
         metrics=compare_result.get("metrics", {}),
         diffs=compare_result.get("diffs", []),
         key_recommendations=compare_result.get("key_recommendations", []),
@@ -293,10 +294,10 @@ async def compare_documents(
 @router.get("", response_model=DocumentListResponse)
 @router.get("/", response_model=DocumentListResponse)
 def list_documents(
-    doc_type: str = Query(None),
-    status: str = Query(None),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    doc_type: Annotated[str | None, Query()] = None,
+    status: Annotated[str | None, Query()] = None,
 ):
     """
     Lists indexed documents strictly scoped to the active user.
@@ -317,8 +318,8 @@ def list_documents(
 @router.get("/{document_id}", response_model=DocumentResponse)
 def get_document(
     document_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
 ):
     """
     Retrieves document metadata ensuring tenant ownership.
@@ -336,9 +337,9 @@ def get_document(
 @router.get("/{document_id}/file")
 def get_document_file(
     document_id: str,
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    db: Annotated[Session, Depends(get_db)],
+    token: Annotated[str | None, Query()] = None,
+    current_user: Annotated[User | None, Depends(get_optional_user)] = None,
 ):
     """
     Streams original document file. Resolves authentication via header or ?token= param.
@@ -350,8 +351,15 @@ def get_document_file(
         query = query.filter(Document.user_id == caller.id)
 
     doc = query.first()
-    if not doc or not os.path.exists(doc.file_path):
+    if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on storage.")
+
+    file_path = str(doc.file_path)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on storage.")
+
+    original_filename = str(doc.original_filename)
+    mime_type = str(doc.mime_type) if doc.mime_type else "application/octet-stream"
 
     # Record view audit trail
     log_audit_event(
@@ -360,22 +368,22 @@ def get_document_file(
         target_type="document",
         target_id=str(doc.id),
         user_id=str(caller.id),
-        metadata={"filename": doc.original_filename, "mime_type": doc.mime_type},
+        metadata={"filename": original_filename, "mime_type": mime_type},
     )
 
     return FileResponse(
-        doc.file_path,
-        media_type=doc.mime_type or "application/octet-stream",
-        filename=doc.original_filename,
+        file_path,
+        media_type=mime_type,
+        filename=original_filename,
     )
 
 
 @router.get("/{document_id}/redacted-file")
 def get_redacted_document_file(
     document_id: str,
-    token: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    db: Annotated[Session, Depends(get_db)],
+    token: Annotated[str | None, Query()] = None,
+    current_user: Annotated[User | None, Depends(get_optional_user)] = None,
 ):
     """
     Returns the physically sanitized, blacked-out redacted PDF for compliance and secure sharing.
@@ -387,10 +395,16 @@ def get_redacted_document_file(
         query = query.filter(Document.user_id == caller.id)
 
     doc = query.first()
-    if not doc or not os.path.exists(doc.file_path):
+    if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source document not found.")
 
-    redacted_path = redactor.get_or_create_redacted_file(doc.id, doc.file_path)
+    doc_id = str(doc.id)
+    file_path = str(doc.file_path)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source document not found.")
+
+    original_filename = str(doc.original_filename)
+    redacted_path = redactor.get_or_create_redacted_file(doc_id, file_path)
     if not os.path.exists(redacted_path):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to locate or generate redacted document.")
 
@@ -399,19 +413,19 @@ def get_redacted_document_file(
         db=db,
         action="viewed_redacted",
         target_type="document",
-        target_id=str(doc.id),
+        target_id=doc_id,
         user_id=str(caller.id),
         metadata={
-            "filename": doc.original_filename,
+            "filename": original_filename,
             "redacted_filename": os.path.basename(redacted_path),
         },
     )
 
-    base_name = Path(doc.original_filename).stem
+    base_name = Path(original_filename).stem
     redacted_ext = Path(redacted_path).suffix.lower()
     download_filename = f"{base_name}_REDACTED{redacted_ext}"
 
-    media_type = doc.mime_type or "application/octet-stream"
+    media_type = str(doc.mime_type) if doc.mime_type else "application/octet-stream"
     if redacted_ext == ".pdf":
         media_type = "application/pdf"
     elif redacted_ext in [".png", ".jpg", ".jpeg", ".webp"]:
@@ -430,8 +444,8 @@ def get_redacted_document_file(
 @router.delete("/{document_id}/")
 def delete_document(
     document_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
 ):
     """
     Idempotent deletion scoped strictly to the caller's documents.
@@ -448,15 +462,19 @@ def delete_document(
     if not doc:
         return {"success": True, "message": f"Document {document_id} was already purged or does not exist."}
 
+    doc_id = str(doc.id)
+    file_path = str(doc.file_path)
+    original_filename = str(doc.original_filename)
+
     # Remove physical original file
-    if os.path.exists(doc.file_path):
+    if os.path.exists(file_path):
         try:
-            os.remove(doc.file_path)
+            os.remove(file_path)
         except Exception:
             pass
 
     # Remove redacted file if generated
-    redacted_path = os.path.join(settings.UPLOAD_DIR, f"{doc.id}_redacted.pdf")
+    redacted_path = os.path.join(settings.UPLOAD_DIR, f"{doc_id}_redacted.pdf")
     if os.path.exists(redacted_path):
         try:
             os.remove(redacted_path)
@@ -464,16 +482,16 @@ def delete_document(
             pass
 
     # Remove vector index
-    vector_service.delete_document(doc.id)
+    vector_service.delete_document(doc_id)
 
     # Log deletion audit event before purging from DB
     log_audit_event(
         db=db,
         action="deleted",
         target_type="document",
-        target_id=str(doc.id),
+        target_id=doc_id,
         user_id=str(current_user.id),
-        metadata={"filename": doc.original_filename, "purged": True},
+        metadata={"filename": original_filename, "purged": True},
     )
 
     # Remove from DB
@@ -486,8 +504,8 @@ def delete_document(
 async def chat_with_document(
     document_id: str,
     request: DocumentChatRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
 ):
     """
     Conversational RAG assistant grounded strictly in the target document.
@@ -500,6 +518,9 @@ async def chat_with_document(
     doc = query.first()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
+
+    doc_id = str(doc.id)
+    doc_original_filename = str(doc.original_filename)
 
     insight = doc.insights
     if not insight:
@@ -515,7 +536,7 @@ async def chat_with_document(
     raw_text = insight.raw_extracted_text or insight.summary or ""
 
     chat_result = await gemini_analyzer.chat_with_document(
-        document_title=str(insight.title or doc.original_filename),
+        document_title=str(insight.title or doc_original_filename or "Document"),
         document_type=str(insight.document_type or "Document"),
         summary=str(insight.summary or ""),
         raw_text=raw_text,
@@ -529,17 +550,17 @@ async def chat_with_document(
         db=db,
         action="chat_query",
         target_type="document",
-        target_id=str(doc.id),
+        target_id=doc_id,
         user_id=str(current_user.id),
         metadata={
             "query": request.message,
-            "filename": str(doc.original_filename),
+            "filename": doc_original_filename,
             "citations_returned": len(chat_result.get("citations", [])),
         },
     )
 
     return DocumentChatResponse(
-        document_id=str(doc.id),
+        document_id=doc_id,
         reply=chat_result.get("reply", "No response generated."),
         citations=chat_result.get("citations", []),
         suggested_followups=chat_result.get("suggested_followups", []),

@@ -1,8 +1,10 @@
 import json
 import logging
+import os
 import re
 from collections import Counter
 from typing import Any
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -144,11 +146,11 @@ class GeminiDocumentAnalyzer:
         self,
         sanitized_text: str,
         filename: str,
-        file_path: str = None,
+        file_path: str | None = None,
         is_scanned: bool = False,
     ) -> dict[str, Any]:
         """
-        Analyzes a document using Gemini Flash. 
+        Analyzes a document using Gemini Flash.
         Falls back to rule-based heuristic extraction if API key is not supplied or fails.
         """
         client = self._get_client()
@@ -156,6 +158,7 @@ class GeminiDocumentAnalyzer:
         if client and self.api_key:
             try:
                 from pathlib import Path
+
                 from google.genai import types
 
                 ext = Path(filename).suffix.lower() if filename else ""
@@ -193,7 +196,7 @@ class GeminiDocumentAnalyzer:
                     },
                 )
 
-                raw_json = response.text.strip()
+                raw_json = (response.text or "").strip()
                 # Clean any markdown if present
                 if raw_json.startswith("```"):
                     raw_json = re.sub(r"^```(?:json)?\n|\n```$", "", raw_json, flags=re.MULTILINE).strip()
@@ -246,14 +249,14 @@ class GeminiDocumentAnalyzer:
         raw_pages = text.split("--- [Page ")
         line_page_counts = Counter()
         for p in raw_pages:
-            seen_in_page = set(l.strip() for l in p.split("\n") if len(l.strip()) > 10)
-            for l in seen_in_page:
-                line_page_counts[l] += 1
-        repeated_boilerplate = set(l for l, count in line_page_counts.items() if count >= 3)
+            seen_in_page = {ln.strip() for ln in p.split("\n") if len(ln.strip()) > 10}
+            for ln in seen_in_page:
+                line_page_counts[ln] += 1
+        repeated_boilerplate = {ln for ln, count in line_page_counts.items() if count >= 3}
 
         clean_lines = []
-        for l in text.split("\n"):
-            s = l.strip()
+        for raw_l in text.split("\n"):
+            s = raw_l.strip()
             if len(s) > 10 and s not in repeated_boilerplate and not s.startswith("---"):
                 clean_lines.append(s)
 
@@ -273,9 +276,9 @@ class GeminiDocumentAnalyzer:
             try:
                 num = float(re.sub(r"[^\d.]", "", a))
                 parsed_amounts.append((num, a))
-            except:
+            except (ValueError, TypeError):
                 pass
-        
+
         parsed_amounts.sort(key=lambda x: x[0], reverse=True)
         total_amount = parsed_amounts[0][1] if parsed_amounts else (amounts[0] if amounts else None)
 
@@ -295,26 +298,24 @@ class GeminiDocumentAnalyzer:
         # 5. Dynamic Entities: Issuer & Recipient
         issuer = None
         recipient = None
-        for l in clean_lines[:15]:
-            if re.match(r"^(?:Client|Customer|Issued To|Policyholder|Bill To|Proposer|Insured Name):\s*(.+)$", l, re.IGNORECASE):
-                m = re.match(r"^(?:Client|Customer|Issued To|Policyholder|Bill To|Proposer|Insured Name):\s*(.+)$", l, re.IGNORECASE)
+        for ln in clean_lines[:15]:
+            if m := re.match(r"^(?:Client|Customer|Issued To|Policyholder|Bill To|Proposer|Insured Name):\s*(.+)$", ln, re.IGNORECASE):
                 recipient = m.group(1).strip()
-            elif re.search(r"\b(?:MR|MS|MRS|DR)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", l):
-                m = re.search(r"\b(?:MR|MS|MRS|DR)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", l)
+            elif m := re.search(r"\b(?:MR|MS|MRS|DR)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", ln):
                 if not recipient:
                     recipient = m.group(0).strip()
-            elif not issuer and re.match(r"^[A-Z][A-Za-z0-9\s,\.]{4,50}(?:Ltd|Limited|Inc|Corp|Corporation|Pvt|Company|Enterprises|Solutions)$", l):
-                issuer = l.strip()
+            elif not issuer and re.match(r"^[A-Z][A-Za-z0-9\s,\.]{4,50}(?:Ltd|Limited|Inc|Corp|Corporation|Pvt|Company|Enterprises|Solutions)$", ln):
+                issuer = ln.strip()
 
         # 6. Dynamic Table Line Items Extraction
         line_items = []
         seen_descs = set()
-        for l in clean_lines:
-            m = re.match(r"^([A-Za-z][A-Za-z0-9\s\(\)\/\-\.\&]{3,60}?)\s+(?:₹|\$|INR|USD|EUR)?\s?([\d,]{1,9}(?:\.\d{2})?)$", l)
+        for ln in clean_lines:
+            m = re.match(r"^([A-Za-z][A-Za-z0-9\s\(\)\/\-\.\&]{3,60}?)\s+(?:₹|\$|INR|USD|EUR)?\s?([\d,]{1,9}(?:\.\d{2})?)$", ln)
             if m:
                 desc = m.group(1).strip()
                 val_str = m.group(2).replace(",", "")
-                if len(val_str) > 8 and not re.search(r"[₹\$]", l):
+                if len(val_str) > 8 and not re.search(r"[₹\$]", ln):
                     continue
                 if desc.lower() in seen_descs:
                     continue
@@ -325,7 +326,7 @@ class GeminiDocumentAnalyzer:
                     num_val = float(val_str)
                     seen_descs.add(desc.lower())
                     line_items.append({"description": desc, "quantity": 1, "amount": num_val})
-                except:
+                except (ValueError, TypeError):
                     pass
 
         # Take the most relevant table rows
@@ -338,23 +339,23 @@ class GeminiDocumentAnalyzer:
             "non-disclosure", "dispute", "governing law"
         ]
         risk_clauses = []
-        for l in clean_lines:
-            l_lower = l.lower()
-            if any(k in l_lower for k in risk_keywords) and 30 < len(l) < 220:
-                if not any(l[:25] in r for r in risk_clauses):
-                    risk_clauses.append(l)
+        for ln in clean_lines:
+            l_lower = ln.lower()
+            if any(k in l_lower for k in risk_keywords) and 30 < len(ln) < 220:
+                if not any(ln[:25] in r for r in risk_clauses):
+                    risk_clauses.append(ln)
 
         risk_clauses = risk_clauses[:6]
 
         # 8. Dynamic Key Points / Section Headings
         key_points = []
-        for l in clean_lines:
-            if re.match(r"^(?:[0-9]{1,2}[\.\)]|[A-Z][\.\)]|Section|Clause|Article|Product|Certificate|Subject:)\s", l, re.IGNORECASE) and 25 < len(l) < 180:
-                if not any(l[:20] in kp for kp in key_points):
-                    key_points.append(l)
+        for ln in clean_lines:
+            if re.match(r"^(?:[0-9]{1,2}[\.\)]|[A-Z][\.\)]|Section|Clause|Article|Product|Certificate|Subject:)\s", ln, re.IGNORECASE) and 25 < len(ln) < 180:
+                if not any(ln[:20] in kp for kp in key_points):
+                    key_points.append(ln)
 
         if not key_points:
-            key_points = [l for l in clean_lines if 30 < len(l) < 150][:5]
+            key_points = [ln for ln in clean_lines if 30 < len(ln) < 150][:5]
         else:
             key_points = key_points[:6]
 
@@ -406,7 +407,7 @@ class GeminiDocumentAnalyzer:
         raw_text: str,
         insights_data: dict,
         message: str,
-        conversation_history: list = None,
+        conversation_history: list[Any] | None = None,
     ) -> dict[str, Any]:
         """
         Conducts a conversational deep-dive with Gemini 3.5 Flash about the active document,
@@ -451,7 +452,7 @@ USER QUESTION:
                         "response_mime_type": "application/json",
                     },
                 )
-                raw_json = response.text.strip()
+                raw_json = (response.text or "").strip()
                 if raw_json.startswith("```"):
                     raw_json = re.sub(r"^```(?:json)?\n|\n```$", "", raw_json, flags=re.MULTILINE).strip()
 
@@ -516,7 +517,7 @@ USER QUESTION:
         doc_b_summary: str,
         doc_b_text: str,
         doc_b_insights: dict,
-        focus_aspects: list = None,
+        focus_aspects: list[str] | None = None,
     ) -> dict:
         """
         Perform automated redline comparison between Document A and Document B using Gemini 3.5 Flash.
@@ -524,14 +525,14 @@ USER QUESTION:
         client = self._get_client()
         if client:
             prompt_parts = [
-                f"# DOCUMENT A (BASE / ORIGINAL REVISION)",
+                "# DOCUMENT A (BASE / ORIGINAL REVISION)",
                 f"Title: {doc_a_title}",
                 f"Type: {doc_a_type}",
                 f"Summary: {doc_a_summary}",
                 f"Structured Insights: {json.dumps(doc_a_insights, indent=2)}",
                 f"Document A Text Content (Excerpt):\n{doc_a_text[:12000]}",
-                f"\n---",
-                f"# DOCUMENT B (TARGET / REVISED VERSION)",
+                "\n---",
+                "# DOCUMENT B (TARGET / REVISED VERSION)",
                 f"Title: {doc_b_title}",
                 f"Type: {doc_b_type}",
                 f"Summary: {doc_b_summary}",
@@ -555,7 +556,7 @@ USER QUESTION:
                             "response_mime_type": "application/json",
                         },
                     )
-                    raw_content = response.text.strip()
+                    raw_content = (response.text or "").strip()
                     if raw_content.startswith("```"):
                         raw_content = re.sub(r"^```(?:json)?\n|\n```$", "", raw_content, flags=re.MULTILINE).strip()
                     parsed = json.loads(raw_content)

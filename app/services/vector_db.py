@@ -114,6 +114,8 @@ class VectorDBService:
             vector=vector,
             payload=metadata,
         )
+        if not self._client:
+            return
         self._client.upsert(
             collection_name=self.collection_name,
             points=[point],
@@ -130,6 +132,9 @@ class VectorDBService:
         """
         Semantic vector search with tenant/user metadata filtering.
         """
+        if not self._client:
+            return []
+
         query_vector = self.get_embedding(query)
         must_filters = []
 
@@ -159,7 +164,7 @@ class VectorDBService:
 
         # qdrant-client v1.20+ uses query_points
         if hasattr(self._client, "query_points"):
-            response = self._client.query_points(
+            response = getattr(self._client, "query_points")(
                 collection_name=self.collection_name,
                 query=query_vector,
                 query_filter=query_filter,
@@ -167,7 +172,7 @@ class VectorDBService:
             )
             raw_points = response.points if hasattr(response, "points") else []
         elif hasattr(self._client, "search"):
-            raw_points = self._client.search(
+            raw_points = getattr(self._client, "search")(
                 collection_name=self.collection_name,
                 query_vector=query_vector,
                 query_filter=query_filter,
@@ -187,6 +192,8 @@ class VectorDBService:
         return matches
 
     def delete_document(self, doc_id: str):
+        if not self._client:
+            return
         try:
             self._client.delete(
                 collection_name=self.collection_name,

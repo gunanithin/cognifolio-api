@@ -1,8 +1,8 @@
-import os
 import csv
 from pathlib import Path
-from pypdf import PdfReader
+
 from PIL import Image
+from pypdf import PdfReader
 
 
 class DocumentExtractor:
@@ -61,8 +61,9 @@ class DocumentExtractor:
                 doc = pymupdf.open(file_path)
                 pages_text = []
                 full_text = []
-                for i, page in enumerate(doc):
-                    t = page.get_text() or ""
+                for i in range(len(doc)):
+                    page = doc[i]
+                    t = str(page.get_text() or "")
                     pages_text.append(t)
                     full_text.append(f"--- [Page {i + 1}] ---\n{t}")
                 doc.close()
@@ -92,7 +93,7 @@ class DocumentExtractor:
                 if not text:
                     continue
 
-                style_name = para.style.name.lower() if para.style else ""
+                style_name = str(getattr(para.style, "name", "") or "").lower()
                 if "heading 1" in style_name:
                     if current_section:
                         sections_text.append("\n".join(current_section))
@@ -201,7 +202,7 @@ class DocumentExtractor:
     def _extract_csv(cls, file_path: str) -> dict:
         try:
             rows = []
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
                 reader = csv.reader(f)
                 for row in reader:
                     if any(cell.strip() for cell in row):
@@ -256,9 +257,9 @@ class DocumentExtractor:
             }
 
     @classmethod
-    def _extract_text(cls, file_path: str, fallback_error: str = None) -> dict:
+    def _extract_text(cls, file_path: str, fallback_error: str | None = None) -> dict:
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
             return {

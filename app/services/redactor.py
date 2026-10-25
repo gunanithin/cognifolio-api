@@ -1,14 +1,15 @@
 import os
 import re
 from pathlib import Path
-from typing import Tuple, Dict, Any, List
+from typing import Any
+
 import pymupdf
 
 
 class PIIRedactor:
     """
     Client-side/Pre-AI PII Redaction & PDF Visual Masking Engine.
-    Ensures sensitive personally identifiable information (PII) is masked 
+    Ensures sensitive personally identifiable information (PII) is masked
     before any text or metadata is sent to third-party AI APIs, and produces
     physically sanitized, black-boxed PDFs for regulatory compliance (SOC2/GDPR/HIPAA).
     """
@@ -57,7 +58,7 @@ class PIIRedactor:
     }
 
     @classmethod
-    def redact(cls, text: str) -> Tuple[str, Dict[str, int]]:
+    def redact(cls, text: str) -> tuple[str, dict[str, int]]:
         """
         Scans text for sensitive patterns and replaces them with clean tokens.
         Returns the sanitized text along with a count report of masked items.
@@ -66,7 +67,7 @@ class PIIRedactor:
             return "", {}
 
         sanitized_text = text
-        stats: Dict[str, int] = {}
+        stats: dict[str, int] = {}
 
         for pii_type, (pattern, replacement) in cls.PATTERNS.items():
             matches = list(pattern.finditer(sanitized_text))
@@ -78,7 +79,7 @@ class PIIRedactor:
         return sanitized_text, stats
 
     @classmethod
-    def extract_pii_strings(cls, text: str) -> List[Tuple[str, str]]:
+    def extract_pii_strings(cls, text: str) -> list[tuple[str, str]]:
         """
         Extracts raw sensitive substring values and their PII categories.
         Returns [(pii_type, matched_string), ...]
@@ -92,12 +93,12 @@ class PIIRedactor:
         return results
 
     @classmethod
-    def redact_pdf_file(cls, input_pdf_path: str, output_pdf_path: str) -> Dict[str, Any]:
+    def redact_pdf_file(cls, input_pdf_path: str, output_pdf_path: str) -> dict[str, Any]:
         """
         Applies visual and structural PDF redactions using PyMuPDF.
         Permanently deletes text objects and applies dark masking rectangles over sensitive PII.
         """
-        stats: Dict[str, int] = {}
+        stats: dict[str, int] = {}
         total_redactions = 0
 
         if not os.path.exists(input_pdf_path):
@@ -105,10 +106,10 @@ class PIIRedactor:
 
         try:
             doc = pymupdf.open(input_pdf_path)
-            
+
             for page_idx in range(len(doc)):
                 page = doc[page_idx]
-                page_text = page.get_text() or ""
+                page_text = str(page.get_text() or "")
                 matches = cls.extract_pii_strings(page_text)
 
                 for pii_type, match_str in matches:
@@ -119,7 +120,7 @@ class PIIRedactor:
                         for r in rects:
                             # Add dark graphite / charcoal redaction box
                             page.add_redact_annot(r, fill=(0.10, 0.12, 0.16))
-                
+
                 # Permanently rasterize/apply redaction annotations on this page
                 page.apply_redactions()
 
@@ -184,7 +185,7 @@ class PIIRedactor:
                 cls.redact_image_file(original_file_path, redacted_path)
             else:
                 try:
-                    with open(original_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    with open(original_file_path, encoding="utf-8", errors="ignore") as f:
                         content = f.read()
                     sanitized, _ = cls.redact(content)
                     with open(redacted_path, "w", encoding="utf-8") as f:
