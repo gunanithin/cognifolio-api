@@ -10,6 +10,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.entities import Document, DocumentInsight, User, AuditLog
 from app.schemas.document import DocumentResponse, DocumentListResponse
+from app.schemas.chat import DocumentChatRequest, DocumentChatResponse
 from app.services.pdf_extractor import extractor
 from app.services.redactor import redactor
 from app.services.gemini import gemini_analyzer
@@ -286,3 +287,63 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
     db.delete(doc)
     db.commit()
     return {"success": True, "message": f"Document {document_id} and its vector data were purged."}
+
+
+@router.post("/{document_id}/chat", response_model=DocumentChatResponse)
+async def chat_with_document(
+    document_id: str,
+    request: DocumentChatRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Conversational RAG assistant grounded strictly in the target document.
+    Returns answers with clickable citations that navigate to the exact PDF coordinates.
+    """
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    insight = doc.insights
+    if not insight:
+        raise HTTPException(status_code=400, detail="Document insights not available yet.")
+
+    insights_data = {
+        "entities": insight.entities or {},
+        "risk_clauses": insight.risk_clauses or [],
+        "line_items": insight.line_items or [],
+        "key_points": insight.key_points or [],
+    }
+
+    raw_text = insight.raw_extracted_text or insight.summary or ""
+
+    chat_result = await gemini_analyzer.chat_with_document(
+        document_title=insight.title or doc.original_filename,
+        document_type=insight.document_type or "Document",
+        summary=insight.summary or "",
+        raw_text=raw_text,
+        insights_data=insights_data,
+        message=request.message,
+        conversation_history=request.conversation_history,
+    )
+
+    # Log immutable audit event for enterprise security
+    log_audit_event(
+        db=db,
+        action="chat_query",
+        target_type="document",
+        target_id=str(doc.id),
+        user_id=str(doc.user_id),
+        metadata={
+            "filename": doc.original_filename,
+            "query": request.message[:200],
+            "citations_returned": len(chat_result.get("citations", [])),
+        },
+    )
+
+    return DocumentChatResponse(
+        document_id=str(doc.id),
+        reply=chat_result["reply"],
+        citations=chat_result["citations"],
+        suggested_followups=chat_result["suggested_followups"],
+    )
+

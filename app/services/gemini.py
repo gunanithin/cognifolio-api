@@ -42,6 +42,36 @@ Analyze the provided document text (or image) with high precision and return a v
 Return ONLY valid JSON with no markdown backticks or commentary.
 """
 
+CHAT_SYSTEM_PROMPT = """You are the Cognifolio Multimodal Document Intelligence Assistant, powered by Gemini 3.5 Flash.
+You are assisting an enterprise analyst with a deep-dive conversation about a specific document loaded in the viewer.
+
+Your job is to answer the user's questions with high precision, grounded strictly in the provided document text and structured insights.
+
+Always return a valid JSON object strictly matching this schema:
+{
+  "reply": "Your detailed, clear answer formatted in clean Markdown with bolding or bullet points where helpful.",
+  "citations": [
+    {
+      "label": "Short reference or section title, e.g. 'Section 4: Payment Terms' or 'Invoice Total'",
+      "text": "Exact short sentence or phrase excerpt (10 to 60 characters) from the document that verifies your answer, so the visual viewer can highlight it on the PDF",
+      "page": 1,
+      "type": "clause" | "entity" | "line_item" | "text"
+    }
+  ],
+  "suggested_followups": [
+    "Suggested question 1?",
+    "Suggested question 2?",
+    "Suggested question 3?"
+  ]
+}
+
+CRITICAL RULES:
+1. Grounding: Answer ONLY using facts from the document. If information is not mentioned, state clearly that the document does not contain that information.
+2. Citations: Every key fact, fee, date, or clause mentioned must include an exact verbatim text excerpt in the `citations` list so the user can click it to jump the PDF canvas directly to that location.
+3. Keep citation text exact (verbatim substring of document text) so the text search engine can locate the exact page and coordinates.
+4. Output: Return ONLY the JSON object without markdown fences or extraneous text.
+"""
+
 
 class GeminiDocumentAnalyzer:
     def __init__(self):
@@ -291,6 +321,112 @@ class GeminiDocumentAnalyzer:
                 "values": values,
             },
             "confidence_score": 0.92,
+        }
+
+    async def chat_with_document(
+        self,
+        document_title: str,
+        document_type: str,
+        summary: str,
+        raw_text: str,
+        insights_data: dict,
+        message: str,
+        conversation_history: list = None,
+    ) -> dict[str, Any]:
+        """
+        Conducts a conversational deep-dive with Gemini 3.5 Flash about the active document,
+        returning answers grounded strictly in the document text with interactive PDF citation links.
+        """
+        client = self._get_client()
+
+        # Format conversation history
+        history_text = ""
+        if conversation_history:
+            turns = []
+            for item in conversation_history[-6:]:
+                role = str(getattr(item, "role", None) or (item.get("role") if isinstance(item, dict) else "user")).capitalize()
+                content = str(getattr(item, "content", None) or (item.get("content") if isinstance(item, dict) else ""))
+                turns.append(f"{role}: {content}")
+            history_text = "\nPrior Conversation Turns:\n" + "\n".join(turns) + "\n"
+
+        prompt = f"""DOCUMENT CONTEXT:
+Title: {document_title}
+Type: {document_type}
+Summary: {summary}
+Key Entities: {json.dumps(insights_data.get('entities', {}))}
+Risk Clauses: {json.dumps(insights_data.get('risk_clauses', []))}
+Line Items: {json.dumps(insights_data.get('line_items', []))}
+
+DOCUMENT RAW CONTENT:
+{raw_text[:60000]}
+
+{history_text}
+USER QUESTION:
+{message}
+"""
+
+        if client and self.api_key:
+            try:
+                response = client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config={
+                        "system_instruction": CHAT_SYSTEM_PROMPT,
+                        "temperature": 0.2,
+                        "response_mime_type": "application/json",
+                    },
+                )
+                raw_json = response.text.strip()
+                if raw_json.startswith("```"):
+                    raw_json = re.sub(r"^```(?:json)?\n|\n```$", "", raw_json, flags=re.MULTILINE).strip()
+
+                parsed = json.loads(raw_json)
+                return {
+                    "reply": parsed.get("reply", "I reviewed the document regarding your question."),
+                    "citations": parsed.get("citations", []),
+                    "suggested_followups": parsed.get("suggested_followups", []),
+                }
+            except Exception as e:
+                logger.warning(f"Gemini chat_with_document call failed ({e}). Falling back to contextual search.")
+
+        # Fallback contextual search
+        return self._fallback_chat_reply(message, raw_text, insights_data, document_title)
+
+    def _fallback_chat_reply(self, message: str, raw_text: str, insights: dict, doc_title: str) -> dict:
+        q_lower = message.lower()
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?\n])\s+", raw_text) if len(s.strip()) > 15]
+
+        # Find matching sentences
+        words = [w for w in re.findall(r"\w+", q_lower) if len(w) > 3 and w not in ["what", "where", "when", "which", "about", "this", "that"]]
+        matches = []
+        if words:
+            for s in sentences:
+                score = sum(1 for w in words if w in s.lower())
+                if score > 0:
+                    matches.append((score, s))
+            matches.sort(key=lambda x: x[0], reverse=True)
+
+        citations = []
+        if matches:
+            best_sentence = matches[0][1]
+            citations.append({
+                "label": "Document Excerpt",
+                "text": best_sentence[:75].strip(),
+                "page": 1,
+                "type": "text",
+            })
+            reply = f"Based on **{doc_title}**, the document states:\n\n> \"{best_sentence}\""
+        else:
+            reply = f"I examined **{doc_title}**, but could not find a specific statement directly addressing your query. You can ask about payment terms, parties involved, or risk clauses."
+
+        return {
+            "reply": reply,
+            "citations": citations,
+            "suggested_followups": [
+                "What are the payment terms?",
+                "Are there any penalty or risk clauses?",
+                "Who are the named parties in this document?"
+            ],
         }
 
 
