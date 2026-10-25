@@ -11,6 +11,7 @@ from app.database import get_db
 from app.models.entities import Document, DocumentInsight, User, AuditLog
 from app.schemas.document import DocumentResponse, DocumentListResponse
 from app.schemas.chat import DocumentChatRequest, DocumentChatResponse
+from app.schemas.comparison import DocumentCompareRequest, DocumentCompareResponse
 from app.services.pdf_extractor import extractor
 from app.services.redactor import redactor
 from app.services.gemini import gemini_analyzer
@@ -164,6 +165,89 @@ async def upload_document(
     )
 
     return doc
+
+
+@router.post("/compare", response_model=DocumentCompareResponse)
+async def compare_documents(
+    request: DocumentCompareRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Automated redline diff comparison between two documents (Doc A vs Doc B).
+    Returns added, removed, and modified clauses, financial deltas, and risk changes.
+    """
+    doc_a = db.query(Document).filter(Document.id == request.base_document_id).first()
+    if not doc_a:
+        raise HTTPException(status_code=404, detail="Base document (Doc A) not found.")
+
+    doc_b = db.query(Document).filter(Document.id == request.target_document_id).first()
+    if not doc_b:
+        raise HTTPException(status_code=404, detail="Target document (Doc B) not found.")
+
+    insight_a = doc_a.insights
+    insight_b = doc_b.insights
+    if not insight_a or not insight_b:
+        raise HTTPException(status_code=400, detail="One or both documents are still processing insights.")
+
+    insights_data_a = {
+        "entities": insight_a.entities or {},
+        "risk_clauses": insight_a.risk_clauses or [],
+        "line_items": insight_a.line_items or [],
+        "key_points": insight_a.key_points or [],
+    }
+    insights_data_b = {
+        "entities": insight_b.entities or {},
+        "risk_clauses": insight_b.risk_clauses or [],
+        "line_items": insight_b.line_items or [],
+        "key_points": insight_b.key_points or [],
+    }
+
+    raw_text_a = insight_a.raw_extracted_text or insight_a.summary or ""
+    raw_text_b = insight_b.raw_extracted_text or insight_b.summary or ""
+
+    compare_result = await gemini_analyzer.compare_documents(
+        doc_a_title=insight_a.title or doc_a.original_filename,
+        doc_a_type=insight_a.document_type or "Document",
+        doc_a_summary=insight_a.summary or "",
+        doc_a_text=raw_text_a,
+        doc_a_insights=insights_data_a,
+        doc_b_title=insight_b.title or doc_b.original_filename,
+        doc_b_type=insight_b.document_type or "Document",
+        doc_b_summary=insight_b.summary or "",
+        doc_b_text=raw_text_b,
+        doc_b_insights=insights_data_b,
+        focus_aspects=request.focus_aspects,
+    )
+
+    # Log immutable audit event
+    log_audit_event(
+        db=db,
+        action="document_comparison",
+        target_type="document_pair",
+        target_id=str(doc_a.id),
+        user_id=str(doc_a.user_id),
+        metadata={
+            "doc_a_filename": doc_a.original_filename,
+            "doc_b_id": str(doc_b.id),
+            "doc_b_filename": doc_b.original_filename,
+            "diffs_count": len(compare_result.get("diffs", [])),
+            "similarity_score": compare_result.get("metrics", {}).get("similarity_score"),
+            "risk_delta": compare_result.get("metrics", {}).get("risk_delta"),
+        },
+    )
+
+    return DocumentCompareResponse(
+        base_document_id=str(doc_a.id),
+        base_document_title=insight_a.title or doc_a.original_filename,
+        base_document_type=insight_a.document_type or "Document",
+        target_document_id=str(doc_b.id),
+        target_document_title=insight_b.title or doc_b.original_filename,
+        target_document_type=insight_b.document_type or "Document",
+        executive_summary=compare_result.get("executive_summary", ""),
+        metrics=compare_result.get("metrics", {}),
+        diffs=compare_result.get("diffs", []),
+        key_recommendations=compare_result.get("key_recommendations", []),
+    )
 
 
 @router.get("", response_model=DocumentListResponse)
@@ -346,4 +430,6 @@ async def chat_with_document(
         citations=chat_result["citations"],
         suggested_followups=chat_result["suggested_followups"],
     )
+
+
 

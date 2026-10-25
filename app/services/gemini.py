@@ -72,6 +72,57 @@ CRITICAL RULES:
 4. Output: Return ONLY the JSON object without markdown fences or extraneous text.
 """
 
+COMPARE_SYSTEM_PROMPT = """You are the Cognifolio Senior Redline & Legal/Procurement Diff Auditor, powered by Gemini 3.5 Flash.
+You are comparing two enterprise documents:
+- Document A (Base Revision / Original Agreement / Purchase Order)
+- Document B (Target Revision / Amendment / Vendor Invoice)
+
+Your goal is to perform automated redlining:
+1. Identify clause additions (present in B but not in A).
+2. Identify clause deletions (present in A but omitted from B).
+3. Identify clause modifications (changed language, shifted obligations, amended schedules).
+4. Identify financial and fee discrepancies (total amount delta, line-item changes, payment term shifts).
+5. Assess enterprise risk impact (has risk increased, decreased, or remained neutral? e.g., indemnity caps removed, warranties shortened, payment windows compressed).
+
+Always return a valid JSON object strictly matching this schema:
+{
+  "executive_summary": "Comprehensive 2-4 sentence executive overview of what changed between Document A and Document B, highlighting major material alterations.",
+  "metrics": {
+    "added_count": 2,
+    "removed_count": 1,
+    "modified_count": 4,
+    "financial_delta": "+$15,000 / +12.5%",
+    "similarity_score": 82.5,
+    "risk_delta": "increased"  // "increased" | "decreased" | "neutral"
+  },
+  "diffs": [
+    {
+      "id": "diff-1",
+      "type": "modified", // "added" | "removed" | "modified" | "unchanged"
+      "category": "liability", // "clause" | "financial" | "liability" | "term" | "entity" | "other"
+      "title": "Limitation of Liability Cap",
+      "doc_a_text": "Supplier's total liability under this agreement shall not exceed 12 months of fees paid ($120,000).",
+      "doc_b_text": "Supplier's liability shall be capped at $25,000, excluding direct damages.",
+      "risk_impact": "increased", // "increased" | "decreased" | "neutral" | "high" | "critical"
+      "explanation": "Document B reduces the liability cap by $95,000, substantially increasing client risk exposure in the event of an outage.",
+      "doc_a_page": 4,
+      "doc_b_page": 5
+    }
+  ],
+  "key_recommendations": [
+    "Negotiate to restore 12-month liability cap or demand reciprocal indemnification.",
+    "Clarify Net-30 payment term discrepancy before signing."
+  ]
+}
+
+CRITICAL RULES:
+1. Grounding: Every diff item must be based strictly on actual differences between Document A and Document B.
+2. If two documents are completely different document types (e.g., an invoice and an insurance policy), explicitly note the fundamental divergence in executive_summary, calculate a low similarity score, and highlight cross-document mismatches.
+3. If they are revisions of the same agreement/policy, extract granular line-by-line clause differences.
+4. Output: Return ONLY the JSON object without markdown fences or extraneous text.
+"""
+
+
 
 class GeminiDocumentAnalyzer:
     def __init__(self):
@@ -428,6 +479,209 @@ USER QUESTION:
                 "Who are the named parties in this document?"
             ],
         }
+
+    async def compare_documents(
+        self,
+        doc_a_title: str,
+        doc_a_type: str,
+        doc_a_summary: str,
+        doc_a_text: str,
+        doc_a_insights: dict,
+        doc_b_title: str,
+        doc_b_type: str,
+        doc_b_summary: str,
+        doc_b_text: str,
+        doc_b_insights: dict,
+        focus_aspects: list = None,
+    ) -> dict:
+        """
+        Perform automated redline comparison between Document A and Document B using Gemini 3.5 Flash.
+        """
+        client = self._get_client()
+        if client:
+            prompt_parts = [
+                f"# DOCUMENT A (BASE / ORIGINAL REVISION)",
+                f"Title: {doc_a_title}",
+                f"Type: {doc_a_type}",
+                f"Summary: {doc_a_summary}",
+                f"Structured Insights: {json.dumps(doc_a_insights, indent=2)}",
+                f"Document A Text Content (Excerpt):\n{doc_a_text[:12000]}",
+                f"\n---",
+                f"# DOCUMENT B (TARGET / REVISED VERSION)",
+                f"Title: {doc_b_title}",
+                f"Type: {doc_b_type}",
+                f"Summary: {doc_b_summary}",
+                f"Structured Insights: {json.dumps(doc_b_insights, indent=2)}",
+                f"Document B Text Content (Excerpt):\n{doc_b_text[:12000]}",
+            ]
+            if focus_aspects:
+                prompt_parts.append(f"\nUser Priority Focus Aspects: {', '.join(focus_aspects)}")
+
+            prompt_parts.append("\nExecute full redline comparison. Return ONLY the strict JSON object with executive_summary, metrics, diffs, and key_recommendations.")
+            user_prompt = "\n".join(prompt_parts)
+
+            for attempt in range(2):
+                try:
+                    response = client.models.generate_content(
+                        model=self.model_name,
+                        contents=user_prompt,
+                        config={
+                            "system_instruction": COMPARE_SYSTEM_PROMPT,
+                            "temperature": 0.2,
+                            "response_mime_type": "application/json",
+                        },
+                    )
+                    raw_content = response.text.strip()
+                    if raw_content.startswith("```"):
+                        raw_content = re.sub(r"^```(?:json)?\n|\n```$", "", raw_content, flags=re.MULTILINE).strip()
+                    parsed = json.loads(raw_content)
+                    if "executive_summary" in parsed and "diffs" in parsed and "metrics" in parsed:
+                        return parsed
+                except Exception as e:
+                    logger.warning(f"Gemini compare_documents call attempt {attempt+1} failed: {e}")
+                    if attempt == 0:
+                        import asyncio
+                        await asyncio.sleep(1.0)
+
+        # Fallback comparison
+        return self._fallback_compare(
+            doc_a_title, doc_a_type, doc_a_summary, doc_a_text, doc_a_insights,
+            doc_b_title, doc_b_type, doc_b_summary, doc_b_text, doc_b_insights
+        )
+
+    def _fallback_compare(
+        self,
+        doc_a_title: str,
+        doc_a_type: str,
+        doc_a_summary: str,
+        doc_a_text: str,
+        doc_a_insights: dict,
+        doc_b_title: str,
+        doc_b_type: str,
+        doc_b_summary: str,
+        doc_b_text: str,
+        doc_b_insights: dict,
+    ) -> dict:
+        """Deterministic comparison fallback based on structured insights and lexical analysis."""
+        diffs = []
+        item_id = 1
+
+        # Check Document Type divergence
+        if doc_a_type.lower() != doc_b_type.lower():
+            diffs.append({
+                "id": f"diff-{item_id}",
+                "type": "modified",
+                "category": "other",
+                "title": "Document Classification Variance",
+                "doc_a_text": f"Document Type: {doc_a_type}",
+                "doc_b_text": f"Document Type: {doc_b_type}",
+                "risk_impact": "high",
+                "explanation": f"Document A is classified as '{doc_a_type}' while Document B is '{doc_b_type}', indicating fundamentally different contractual or operational purposes.",
+                "doc_a_page": 1,
+                "doc_b_page": 1,
+            })
+            item_id += 1
+
+        # Compare Financials / Entities
+        entities_a = doc_a_insights.get("entities") or {}
+        entities_b = doc_b_insights.get("entities") or {}
+        fin_a = entities_a.get("financial") or {}
+        fin_b = entities_b.get("financial") or {}
+
+        tot_a = fin_a.get("total_amount")
+        tot_b = fin_b.get("total_amount")
+        fin_delta_str = None
+        if tot_a or tot_b:
+            if tot_a != tot_b:
+                fin_delta_str = f"From {tot_a or 'Unspecified'} to {tot_b or 'Unspecified'}"
+                diffs.append({
+                    "id": f"diff-{item_id}",
+                    "type": "modified",
+                    "category": "financial",
+                    "title": "Total Contract / Invoiced Valuation",
+                    "doc_a_text": f"Total: {tot_a or 'Not defined'}",
+                    "doc_b_text": f"Total: {tot_b or 'Not defined'}",
+                    "risk_impact": "increased" if tot_b and not tot_a else "neutral",
+                    "explanation": f"Commercial discrepancy detected: valuation changed from '{tot_a}' in Document A to '{tot_b}' in Document B.",
+                    "doc_a_page": 1,
+                    "doc_b_page": 1,
+                })
+                item_id += 1
+
+        # Compare Risk Clauses
+        clauses_a = {c.get("clause", ""): c for c in doc_a_insights.get("risk_clauses", []) if isinstance(c, dict)}
+        clauses_b = {c.get("clause", ""): c for c in doc_b_insights.get("risk_clauses", []) if isinstance(c, dict)}
+
+        for c_title, c_val in clauses_b.items():
+            if c_title not in clauses_a:
+                diffs.append({
+                    "id": f"diff-{item_id}",
+                    "type": "added",
+                    "category": "clause",
+                    "title": c_title or "Added Clause",
+                    "doc_a_text": "",
+                    "doc_b_text": c_val.get("excerpt", c_val.get("reason", "")),
+                    "risk_impact": c_val.get("severity", "neutral"),
+                    "explanation": f"New provision introduced in Document B: {c_val.get('reason', 'Clause added to target version.')}",
+                    "doc_a_page": None,
+                    "doc_b_page": c_val.get("page", 1),
+                })
+                item_id += 1
+
+        for c_title, c_val in clauses_a.items():
+            if c_title not in clauses_b:
+                diffs.append({
+                    "id": f"diff-{item_id}",
+                    "type": "removed",
+                    "category": "clause",
+                    "title": c_title or "Removed Clause",
+                    "doc_a_text": c_val.get("excerpt", c_val.get("reason", "")),
+                    "doc_b_text": "",
+                    "risk_impact": "increased" if c_val.get("severity") in ["high", "critical"] else "neutral",
+                    "explanation": f"Clause from Document A was omitted in Document B: {c_val.get('reason', 'Removed from target version.')}",
+                    "doc_a_page": c_val.get("page", 1),
+                    "doc_b_page": None,
+                })
+                item_id += 1
+
+        # Jaccard lexical similarity
+        words_a = set(re.findall(r"\w+", doc_a_text.lower()))
+        words_b = set(re.findall(r"\w+", doc_b_text.lower()))
+        intersection = words_a.intersection(words_b)
+        union = words_a.union(words_b)
+        similarity = round((len(intersection) / len(union) * 100), 1) if union else 100.0
+
+        added_cnt = sum(1 for d in diffs if d["type"] == "added")
+        removed_cnt = sum(1 for d in diffs if d["type"] == "removed")
+        modified_cnt = sum(1 for d in diffs if d["type"] == "modified")
+
+        risk_delta = "neutral"
+        if any(d["risk_impact"] in ["high", "critical", "increased"] for d in diffs):
+            risk_delta = "increased"
+
+        exec_summary = (
+            f"Comparison between '{doc_a_title}' and '{doc_b_title}' identified {len(diffs)} material variations "
+            f"with an overall content similarity of {similarity}%. "
+            f"{'Target document introduces heightened risk exposure.' if risk_delta == 'increased' else 'Terms remain broadly aligned without major liability shifts.'}"
+        )
+
+        return {
+            "executive_summary": exec_summary,
+            "metrics": {
+                "added_count": added_cnt,
+                "removed_count": removed_cnt,
+                "modified_count": modified_cnt,
+                "financial_delta": fin_delta_str,
+                "similarity_score": similarity,
+                "risk_delta": risk_delta,
+            },
+            "diffs": diffs,
+            "key_recommendations": [
+                "Audit added and omitted clauses with counsel prior to contract execution.",
+                "Verify fee calculations and payment schedules against agreed purchase orders.",
+            ],
+        }
+
 
 
 gemini_analyzer = GeminiDocumentAnalyzer()
