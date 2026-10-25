@@ -1,16 +1,20 @@
+import os
 import re
-from typing import Tuple
+from pathlib import Path
+from typing import Tuple, Dict, Any, List
+import pymupdf
 
 
 class PIIRedactor:
     """
-    Client-side/Pre-AI PII Redaction Engine.
+    Client-side/Pre-AI PII Redaction & PDF Visual Masking Engine.
     Ensures sensitive personally identifiable information (PII) is masked 
-    before any text or metadata is sent to third-party AI APIs.
+    before any text or metadata is sent to third-party AI APIs, and produces
+    physically sanitized, black-boxed PDFs for regulatory compliance (SOC2/GDPR/HIPAA).
     """
 
     PATTERNS = {
-        # Indian Aadhaar Card (12 digits, often formatted as 4-4-4)
+        # Indian Aadhaar Card (12 digits, often formatted as 4-4-4 or contiguous)
         "aadhaar": (
             re.compile(r"\b[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}\b"),
             "[REDACTED_AADHAAR]",
@@ -53,7 +57,7 @@ class PIIRedactor:
     }
 
     @classmethod
-    def redact(cls, text: str) -> Tuple[str, dict[str, int]]:
+    def redact(cls, text: str) -> Tuple[str, Dict[str, int]]:
         """
         Scans text for sensitive patterns and replaces them with clean tokens.
         Returns the sanitized text along with a count report of masked items.
@@ -62,7 +66,7 @@ class PIIRedactor:
             return "", {}
 
         sanitized_text = text
-        stats = {}
+        stats: Dict[str, int] = {}
 
         for pii_type, (pattern, replacement) in cls.PATTERNS.items():
             matches = list(pattern.finditer(sanitized_text))
@@ -72,6 +76,85 @@ class PIIRedactor:
                 sanitized_text = pattern.sub(replacement, sanitized_text)
 
         return sanitized_text, stats
+
+    @classmethod
+    def extract_pii_strings(cls, text: str) -> List[Tuple[str, str]]:
+        """
+        Extracts raw sensitive substring values and their PII categories.
+        Returns [(pii_type, matched_string), ...]
+        """
+        results = []
+        for pii_type, (pattern, _) in cls.PATTERNS.items():
+            for m in pattern.finditer(text):
+                val = m.group(0).strip()
+                if val:
+                    results.append((pii_type, val))
+        return results
+
+    @classmethod
+    def redact_pdf_file(cls, input_pdf_path: str, output_pdf_path: str) -> Dict[str, Any]:
+        """
+        Applies visual and structural PDF redactions using PyMuPDF.
+        Permanently deletes text objects and applies dark masking rectangles over sensitive PII.
+        """
+        stats: Dict[str, int] = {}
+        total_redactions = 0
+
+        if not os.path.exists(input_pdf_path):
+            raise FileNotFoundError(f"Source file not found: {input_pdf_path}")
+
+        try:
+            doc = pymupdf.open(input_pdf_path)
+            
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                page_text = page.get_text() or ""
+                matches = cls.extract_pii_strings(page_text)
+
+                for pii_type, match_str in matches:
+                    rects = page.search_for(match_str)
+                    if rects:
+                        stats[pii_type] = stats.get(pii_type, 0) + len(rects)
+                        total_redactions += len(rects)
+                        for r in rects:
+                            # Add dark graphite / charcoal redaction box
+                            page.add_redact_annot(r, fill=(0.10, 0.12, 0.16))
+                
+                # Permanently rasterize/apply redaction annotations on this page
+                page.apply_redactions()
+
+            # Ensure destination directory exists
+            os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+            doc.save(output_pdf_path)
+            doc.close()
+
+            return {
+                "success": True,
+                "total_redactions": total_redactions,
+                "pii_stats": stats,
+                "output_path": output_pdf_path,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "total_redactions": 0,
+                "pii_stats": {},
+            }
+
+    @classmethod
+    def get_or_create_redacted_pdf(cls, doc_id: str, original_file_path: str) -> str:
+        """
+        Returns the path to the redacted PDF, generating it if it doesn't already exist.
+        """
+        directory = os.path.dirname(original_file_path)
+        redacted_filename = f"{doc_id}_redacted.pdf"
+        redacted_path = os.path.join(directory, redacted_filename)
+
+        if not os.path.exists(redacted_path):
+            cls.redact_pdf_file(original_file_path, redacted_path)
+
+        return redacted_path
 
 
 redactor = PIIRedactor()

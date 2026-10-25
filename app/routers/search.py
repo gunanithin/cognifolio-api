@@ -4,6 +4,7 @@ from app.database import get_db
 from app.models.entities import Document, DocumentInsight
 from app.schemas.search import SearchRequest, SearchResponse, SearchResultItem
 from app.services.vector_db import vector_service
+from app.services.audit import log_audit_event
 
 router = APIRouter(prefix="/search", tags=["Semantic Search"])
 
@@ -85,6 +86,19 @@ def semantic_search(request: SearchRequest, db: Session = Depends(get_db)):
                     uploaded_at=doc.uploaded_at.strftime("%Y-%m-%d %H:%M"),
                 )
             )
+
+    # Log search audit event
+    log_audit_event(
+        db=db,
+        action="searched",
+        target_type="search_query",
+        target_id=None,
+        metadata={
+            "query": request.query,
+            "document_type_filter": request.document_type,
+            "matches_found": len(results),
+        },
+    )
 
     return SearchResponse(
         query=request.query,
