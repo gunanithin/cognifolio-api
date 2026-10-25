@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Storage
     UPLOAD_DIR: str = "./uploads"
     MAX_FILE_SIZE_MB: int = 25
-    ALLOWED_EXTENSIONS: str = "pdf,png,jpg,jpeg,webp,txt"
+    ALLOWED_EXTENSIONS: str = "pdf,png,jpg,jpeg,webp,docx,doc,xlsx,xls,csv,txt,md"
 
     @property
     def allowed_extensions_list(self) -> list[str]:

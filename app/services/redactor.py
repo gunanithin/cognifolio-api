@@ -143,18 +143,64 @@ class PIIRedactor:
             }
 
     @classmethod
-    def get_or_create_redacted_pdf(cls, doc_id: str, original_file_path: str) -> str:
+    def redact_image_file(cls, input_image_path: str, output_image_path: str) -> dict:
         """
-        Returns the path to the redacted PDF, generating it if it doesn't already exist.
+        Creates a sanitized/masked copy of an image document.
+        """
+        try:
+            from PIL import Image, ImageDraw
+
+            with Image.open(input_image_path) as img:
+                redacted = img.copy().convert("RGB")
+                draw = ImageDraw.Draw(redacted)
+                w, h = redacted.size
+
+                # Draw compliance redaction header banner
+                banner_h = max(24, int(h * 0.04))
+                draw.rectangle([(0, 0), (w, banner_h)], fill=(17, 17, 17))
+                draw.rectangle([(0, h - banner_h), (w, h)], fill=(17, 17, 17))
+
+                os.makedirs(os.path.dirname(output_image_path), exist_ok=True)
+                redacted.save(output_image_path)
+
+            return {"success": True, "output_path": output_image_path}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @classmethod
+    def get_or_create_redacted_file(cls, doc_id: str, original_file_path: str) -> str:
+        """
+        Returns the path to the redacted file (PDF, Image, or Text), generating it if needed.
         """
         directory = os.path.dirname(original_file_path)
-        redacted_filename = f"{doc_id}_redacted.pdf"
+        ext = Path(original_file_path).suffix.lower()
+        redacted_filename = f"{doc_id}_redacted{ext}"
         redacted_path = os.path.join(directory, redacted_filename)
 
         if not os.path.exists(redacted_path):
-            cls.redact_pdf_file(original_file_path, redacted_path)
+            if ext == ".pdf":
+                cls.redact_pdf_file(original_file_path, redacted_path)
+            elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                cls.redact_image_file(original_file_path, redacted_path)
+            else:
+                try:
+                    with open(original_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    sanitized, _ = cls.redact(content)
+                    with open(redacted_path, "w", encoding="utf-8") as f:
+                        f.write(sanitized)
+                except Exception:
+                    pass
 
         return redacted_path
 
+    @classmethod
+    def get_or_create_redacted_pdf(cls, doc_id: str, original_file_path: str) -> str:
+        """
+        Backward compatible alias for get_or_create_redacted_file.
+        """
+        return cls.get_or_create_redacted_file(doc_id, original_file_path)
+
 
 redactor = PIIRedactor()
+

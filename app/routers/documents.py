@@ -110,12 +110,11 @@ async def upload_document(
     # 2. PII Redaction
     sanitized_text, pii_stats = redactor.redact(raw_text)
 
-    # Pre-generate physically redacted PDF if PDF file
-    if ext == "pdf":
-        try:
-            redactor.get_or_create_redacted_pdf(doc.id, file_path)
-        except Exception:
-            pass
+    # Pre-generate physically redacted file (PDF, Image, or Text)
+    try:
+        redactor.get_or_create_redacted_file(doc.id, file_path)
+    except Exception:
+        pass
 
     # 3. AI Analysis (Gemini 3.5 Flash)
     ai_insights = await gemini_analyzer.analyze_document(
@@ -124,6 +123,13 @@ async def upload_document(
         file_path=file_path,
         is_scanned=is_scanned,
     )
+
+    # If image transcription was performed by Gemini, capture it in sanitized_text & index
+    if ai_insights.get("raw_extracted_text") and (not raw_text or raw_text.startswith("[Scanned Image")):
+        gemini_text = ai_insights["raw_extracted_text"]
+        sanitized_text, extra_pii = redactor.redact(gemini_text)
+        for k, v in extra_pii.items():
+            pii_stats[k] = pii_stats.get(k, 0) + v
 
     # 4. Save Insights in DB
     insight = DocumentInsight(
@@ -384,7 +390,7 @@ def get_redacted_document_file(
     if not doc or not os.path.exists(doc.file_path):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source document not found.")
 
-    redacted_path = redactor.get_or_create_redacted_pdf(doc.id, doc.file_path)
+    redacted_path = redactor.get_or_create_redacted_file(doc.id, doc.file_path)
     if not os.path.exists(redacted_path):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to locate or generate redacted document.")
 
@@ -402,11 +408,20 @@ def get_redacted_document_file(
     )
 
     base_name = Path(doc.original_filename).stem
-    download_filename = f"{base_name}_REDACTED.pdf"
+    redacted_ext = Path(redacted_path).suffix.lower()
+    download_filename = f"{base_name}_REDACTED{redacted_ext}"
+
+    media_type = doc.mime_type or "application/octet-stream"
+    if redacted_ext == ".pdf":
+        media_type = "application/pdf"
+    elif redacted_ext in [".png", ".jpg", ".jpeg", ".webp"]:
+        media_type = f"image/{redacted_ext.replace('.', '')}"
+    elif redacted_ext in [".txt", ".md"]:
+        media_type = "text/plain; charset=utf-8"
 
     return FileResponse(
         redacted_path,
-        media_type="application/pdf",
+        media_type=media_type,
         filename=download_filename,
     )
 

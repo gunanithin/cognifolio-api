@@ -37,7 +37,8 @@ Analyze the provided document text (or image) with high precision and return a v
     "title": "Cost / Item Breakdown",
     "labels": ["Item A", "Item B"],
     "values": [5000, 3000]
-  }
+  },
+  "extracted_text": "Complete, verbatim text and tables transcribed from the document or image"
 }
 Return ONLY valid JSON with no markdown backticks or commentary.
 """
@@ -154,15 +155,37 @@ class GeminiDocumentAnalyzer:
 
         if client and self.api_key:
             try:
-                # If it's a scanned PDF/image and file exists, we can pass file directly or text
-                prompt = (
-                    f"Document Filename: {filename}\n"
-                    f"Document Content:\n{sanitized_text[:120000]}"
-                )
+                from pathlib import Path
+                from google.genai import types
+
+                ext = Path(filename).suffix.lower() if filename else ""
+                contents = []
+
+                if file_path and os.path.exists(file_path) and ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                    mime_map = {
+                        ".png": "image/png",
+                        ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg",
+                        ".webp": "image/webp",
+                    }
+                    mime_type = mime_map.get(ext, "image/jpeg")
+                    with open(file_path, "rb") as f:
+                        img_bytes = f.read()
+                    contents.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+                    contents.append(
+                        f"Document Filename: {filename}\n"
+                        f"Perform deep multimodal document intelligence on this image. "
+                        f"Extract full text transcription into 'extracted_text', detect all entities, amounts, line items, and summarize."
+                    )
+                else:
+                    contents.append(
+                        f"Document Filename: {filename}\n"
+                        f"Document Content:\n{sanitized_text[:120000]}"
+                    )
 
                 response = client.models.generate_content(
                     model=self.model_name,
-                    contents=prompt,
+                    contents=contents,
                     config={
                         "system_instruction": EXTRACTION_SYSTEM_PROMPT,
                         "temperature": 0.1,
@@ -195,6 +218,7 @@ class GeminiDocumentAnalyzer:
             "action_items": data.get("action_items") or [],
             "risk_clauses": data.get("risk_clauses") or [],
             "charts_data": data.get("charts_data") or {"chart_type": "none", "labels": [], "values": []},
+            "raw_extracted_text": data.get("extracted_text") or "",
             "confidence_score": 0.95,
         }
 
