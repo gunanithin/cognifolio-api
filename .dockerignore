@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+.git
+uploads/*
+!uploads/.gitkeep
+*.db
+.env
+qdrant_storage
