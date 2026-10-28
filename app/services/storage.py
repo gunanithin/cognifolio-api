@@ -22,11 +22,20 @@ class StorageService:
         self.client = None
         self.bucket = None
         self.is_gcs_active = False
+        self.init_error = None
         self._init_gcs()
 
     def _init_gcs(self):
-        bucket_name = (settings.GCS_BUCKET_NAME or "").strip()
+        self.init_error = None
+        bucket_name = (
+            getattr(settings, "GCS_BUCKET_NAME", None)
+            or getattr(settings, "GCS_BUCKET", None)
+            or os.environ.get("GCS_BUCKET_NAME", "")
+            or os.environ.get("GCS_BUCKET", "")
+        ).strip()
+
         if not bucket_name:
+            self.init_error = "GCS_BUCKET_NAME is not set or empty in environment"
             logger.info("GCS_BUCKET_NAME not configured; using local file storage.")
             return
 
@@ -36,35 +45,77 @@ class StorageService:
 
             creds = None
             # 1. From raw JSON string in environment variable
-            if settings.GCS_CREDENTIALS_JSON:
+            raw_json = (
+                getattr(settings, "GCS_CREDENTIALS_JSON", None)
+                or os.environ.get("GCS_CREDENTIALS_JSON", "")
+            ).strip()
+
+            if raw_json:
+                # Strip potential surrounding quotes from env copy-paste
+                if (raw_json.startswith("'") and raw_json.endswith("'")) or (
+                    raw_json.startswith('"') and raw_json.endswith('"') and not raw_json.startswith('{"')
+                ):
+                    raw_json = raw_json[1:-1].strip()
+
+                info = None
                 try:
-                    info = json.loads(settings.GCS_CREDENTIALS_JSON)
+                    info = json.loads(raw_json)
+                except Exception as json_err:
+                    import base64
+                    try:
+                        decoded = base64.b64decode(raw_json).decode("utf-8")
+                        info = json.loads(decoded)
+                    except Exception:
+                        self.init_error = f"Failed to parse GCS_CREDENTIALS_JSON: {json_err}"
+                        logger.warning(self.init_error)
+
+                if info and isinstance(info, dict):
+                    if "private_key" in info and "\\n" in info["private_key"]:
+                        info["private_key"] = info["private_key"].replace("\\n", "\n")
                     creds = service_account.Credentials.from_service_account_info(info)
                     logger.info("Loaded GCS credentials from GCS_CREDENTIALS_JSON.")
-                except Exception as e:
-                    logger.warning(f"Failed to parse GCS_CREDENTIALS_JSON: {e}")
 
-            # 2. From Service Account JSON file path
-            if not creds and settings.GCS_CREDENTIALS_FILE:
-                cred_file = os.path.expanduser(settings.GCS_CREDENTIALS_FILE)
+            # 2. From Service Account JSON file path (or GOOGLE_APPLICATION_CREDENTIALS)
+            file_path = (
+                getattr(settings, "GCS_CREDENTIALS_FILE", None)
+                or getattr(settings, "GOOGLE_APPLICATION_CREDENTIALS", None)
+                or os.environ.get("GCS_CREDENTIALS_FILE", "")
+                or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+            )
+            if not creds and file_path:
+                cred_file = os.path.expanduser(file_path.strip())
                 if os.path.exists(cred_file):
                     creds = service_account.Credentials.from_service_account_file(cred_file)
                     logger.info(f"Loaded GCS credentials from file: {cred_file}")
                 else:
-                    logger.warning(f"GCS_CREDENTIALS_FILE not found: {cred_file}")
+                    msg = f"Credentials file not found: {cred_file}"
+                    if not self.init_error:
+                        self.init_error = msg
+                    logger.warning(msg)
+
+            if not creds:
+                if not self.init_error:
+                    self.init_error = "No valid credentials found (both GCS_CREDENTIALS_JSON and GCS_CREDENTIALS_FILE missing or invalid)"
+                self.is_gcs_active = False
+                return
 
             # 3. Initialize storage client
-            project = settings.GCS_PROJECT_ID or None
-            if creds:
-                self.client = storage.Client(credentials=creds, project=project or creds.project_id)
-            else:
-                self.client = storage.Client(project=project)
+            project = (
+                getattr(settings, "GCS_PROJECT_ID", None)
+                or getattr(settings, "GCP_PROJECT_ID", None)
+                or os.environ.get("GCS_PROJECT_ID", "")
+                or os.environ.get("GCP_PROJECT_ID", "")
+                or creds.project_id
+            )
 
+            self.client = storage.Client(credentials=creds, project=project or creds.project_id)
             self.bucket = self.client.bucket(bucket_name)
             self.is_gcs_active = True
+            self.init_error = None
             logger.info(f"Google Cloud Storage initialized successfully. Active bucket: gs://{bucket_name}")
 
         except Exception as e:
+            self.init_error = f"GCS client initialization error: {e}"
             logger.error(f"Failed to initialize Google Cloud Storage ({e}). Falling back to local storage.")
             self.is_gcs_active = False
 

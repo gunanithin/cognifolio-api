@@ -31,9 +31,11 @@ class Settings(BaseSettings):
     # Storage
     STORAGE_PROVIDER: str = "gcs"  # 'gcs' | 'local'
     GCS_BUCKET_NAME: str = ""
+    GCS_BUCKET: str = ""  # alias for GCS_BUCKET_NAME
     GCS_PROJECT_ID: str = ""
     GCS_CREDENTIALS_FILE: str = ""  # path to service account JSON, e.g. ./gcp-credentials.json
     GCS_CREDENTIALS_JSON: str = ""  # inline JSON string for container/cloud deploys
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""  # standard GCP credentials path alias
     UPLOAD_DIR: str = "./uploads"
     MAX_FILE_SIZE_MB: int = 50
     ALLOWED_EXTENSIONS: str = "pdf,png,jpg,jpeg,webp,docx,doc,xlsx,xls,csv,txt,md"
