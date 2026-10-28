@@ -10,38 +10,61 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 EXTRACTION_SYSTEM_PROMPT = """You are an Enterprise Multimodal Document Intelligence Analyst.
-Analyze the provided document text (or image) with high precision and return a valid JSON object strictly matching this schema:
+Analyze the provided document text or visual scan/image with extreme precision and depth.
+You process ANY business document: contracts, invoices, financial models, insurance policies, healthcare records, identity credentials, dashboards, receipts, tax filings, tables, and reports.
+
+Return a valid JSON object strictly matching this schema:
 {
-  "document_type": "Invoice" | "Contract" | "Financial Report" | "Tax Document" | "Policy" | "Employment Agreement" | "General Document",
-  "title": "Concise descriptive document title",
-  "summary": "Crisp executive summary in 3-5 sentences highlighting the most important findings and purpose",
-  "key_points": ["Point 1", "Point 2", "Point 3", "Point 4"],
+  "document_type": "Invoice" | "Contract" | "Financial Report" | "Tax Document" | "Policy" | "Insurance Document" | "Employment Agreement" | "Dashboard / Portal" | "Identity Document" | "Receipt" | "General Document",
+  "title": "Concise, descriptive title that accurately reflects the true document subject, organization, or portal",
+  "summary": "Crisp executive summary in 3-5 sentences highlighting the most important findings, parties, numbers, and operational purpose",
+  "key_points": [
+    "Substantive, factual finding 1 derived directly from the document content",
+    "Substantive, factual finding 2",
+    "Substantive, factual finding 3",
+    "Substantive, factual finding 4"
+  ],
   "entities": {
-    "vendor_or_issuer": "string or null",
-    "client_or_recipient": "string or null",
-    "total_amount": "formatted string with currency or null",
-    "currency": "INR | USD | EUR | etc. or null",
-    "invoice_number": "string or null",
-    "effective_date": "YYYY-MM-DD or readable string or null",
-    "due_date": "YYYY-MM-DD or readable string or null"
+    "vendor_or_issuer": "Issuing company, portal, authority, or vendor (or {\"value\": \"...\", \"box_2d\": [ymin, xmin, ymax, xmax]})",
+    "client_or_recipient": "Recipient, user, policyholder, customer, or individual (or {\"value\": \"...\", \"box_2d\": [ymin, xmin, ymax, xmax]})",
+    "total_amount": "Total financial amount or premium or balance if present, else null (or {\"value\": \"...\", \"box_2d\": [ymin, xmin, ymax, xmax]})",
+    "currency": "Currency code (INR, USD, EUR, GBP, etc.) if detectable, else null",
+    "invoice_number": "Reference number, invoice ID, policy number, or transaction ID if present, else null",
+    "effective_date": "Start date, policy issuance date, or agreement date if present, else null",
+    "due_date": "Due date, renewal date, or expiry date if present, else null"
   },
   "line_items": [
-    {"description": "Item description", "quantity": 1, "amount": 1000.0}
+    {"description": "Item, policy, service, or entry description", "quantity": 1, "amount": 1000.0, "box_2d": [ymin, xmin, ymax, xmax]}
   ],
   "action_items": [
-    "Immediate action or deadline required"
+    "Immediate action, renewal, review item, or deadline if applicable"
   ],
   "risk_clauses": [
-    "Penalty or auto-renewal or liability clause if applicable"
+    "Identified risk, penalty, exclusion, forfeiture, or liability clause if applicable"
   ],
   "charts_data": {
     "chart_type": "pie" | "bar" | "none",
-    "title": "Cost / Item Breakdown",
+    "title": "Distribution or Breakdown",
     "labels": ["Item A", "Item B"],
     "values": [5000, 3000]
   },
   "extracted_text": "Complete, verbatim text and tables transcribed from the document or image"
 }
+
+SPATIAL BOUNDING BOXES FOR IMAGES & SCANS:
+When analyzing an image or scan (PNG, JPG, WEBP), for each identified entity (issuer, recipient, amount, reference number, dates) and each line item or card entry, detect its exact 2D spatial bounding box `box_2d: [ymin, xmin, ymax, xmax]` normalized on a 0-1000 integer scale (where 0,0 is top-left and 1000,1000 is bottom-right of the image).
+Example format:
+"vendor_or_issuer": {"value": "PortfoTrack", "box_2d": [27, 39, 50, 112]}
+"client_or_recipient": {"value": "John Doe", "box_2d": [784, 19, 800, 66]}
+"total_amount": {"value": "$1,250.00", "box_2d": [780, 650, 815, 880]}
+"line_items": [{"description": "Cloud Hosting", "quantity": 1, "amount": 120.0, "box_2d": [450, 120, 480, 880]}]
+If an entity's coordinates are not identifiable or for plain text files, provide the string directly or leave box_2d as null.
+
+MANDATORY LEAF-LEVEL GRANULARITY FOR BOUNDING BOXES & LINE ITEMS:
+- When analyzing diagrams, flowcharts, architectures, invoices, receipts, dashboards, or tables, NEVER group an entire column, section, or parent container into one compound entry (e.g. do NOT return "Backend & Processing (FastAPI, PII Redaction Engine, Temporal Workflow Orchestration, Gemini Flash API)" with a giant bounding box covering the entire column).
+- Instead, extract every individual leaf element, sub-card, workflow node, database block, table row, or button as its own dedicated entry in `line_items`.
+- Each entry MUST have its own tight, precise `box_2d: [ymin, xmin, ymax, xmax]` bounding box tightly wrapping that specific component.
+- For example, in an architecture diagram with a "Backend & Processing" column containing "PII Redaction Engine", "FastAPI Gateway", "Temporal Orchestration", and "Gemini Flash API", create 4 separate line items, one for each sub-box!
 Return ONLY valid JSON with no markdown backticks or commentary.
 """
 
@@ -150,74 +173,216 @@ class GeminiDocumentAnalyzer:
         is_scanned: bool = False,
     ) -> dict[str, Any]:
         """
-        Analyzes a document using Gemini Flash.
-        Falls back to rule-based heuristic extraction if API key is not supplied or fails.
+        Analyzes a document using Gemini multimodal intelligence with multi-model fallback and backoff retries.
+        Falls back to rule-based heuristic extraction only if all AI attempts fail on text documents.
         """
         client = self._get_client()
 
         if client and self.api_key:
-            try:
-                from pathlib import Path
+            import asyncio
+            from pathlib import Path
+            from google.genai import types
 
-                from google.genai import types
+            ext = Path(filename).suffix.lower() if filename else ""
+            is_image = bool(file_path and os.path.exists(file_path) and ext in [".png", ".jpg", ".jpeg", ".webp"])
 
-                ext = Path(filename).suffix.lower() if filename else ""
-                contents = []
-
-                if file_path and os.path.exists(file_path) and ext in [".png", ".jpg", ".jpeg", ".webp"]:
-                    mime_map = {
-                        ".png": "image/png",
-                        ".jpg": "image/jpeg",
-                        ".jpeg": "image/jpeg",
-                        ".webp": "image/webp",
-                    }
-                    mime_type = mime_map.get(ext, "image/jpeg")
-                    with open(file_path, "rb") as f:
-                        img_bytes = f.read()
-                    contents.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
-                    contents.append(
-                        f"Document Filename: {filename}\n"
-                        f"Perform deep multimodal document intelligence on this image. "
-                        f"Extract full text transcription into 'extracted_text', detect all entities, amounts, line items, and summarize."
-                    )
-                else:
-                    contents.append(
-                        f"Document Filename: {filename}\n"
-                        f"Document Content:\n{sanitized_text[:120000]}"
-                    )
-
-                response = client.models.generate_content(
-                    model=self.model_name,
-                    contents=contents,
-                    config={
-                        "system_instruction": EXTRACTION_SYSTEM_PROMPT,
-                        "temperature": 0.1,
-                        "response_mime_type": "application/json",
-                    },
+            contents = []
+            if is_image:
+                mime_map = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                }
+                mime_type = mime_map.get(ext, "image/jpeg")
+                with open(file_path, "rb") as f:
+                    img_bytes = f.read()
+                contents.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+                contents.append(
+                    f"Document Filename: {filename}\n"
+                    f"Perform deep multimodal document intelligence on this visual document scan.\n"
+                    f"1. Transcribe the entire document verbatim into 'extracted_text'.\n"
+                    f"2. Extract true business intelligence: document_type, title, executive summary, and substantive key takeaways.\n"
+                    f"3. Identify all key entities (issuing organization, recipient/user, reference numbers, amounts, dates, status).\n"
+                    f"4. For every identified entity and line item / card, calculate its exact 2D spatial bounding box coordinates [ymin, xmin, ymax, xmax] on a 0-1000 normalized scale.\n"
+                    f"5. IMPORTANT: Extract granular leaf components individually. NEVER lump an entire column, section, or table into a single compound line item. Every individual card, module, node, or row must be its own line item with its own tight bounding box."
+                )
+            else:
+                contents.append(
+                    f"Document Filename: {filename}\n"
+                    f"Document Content:\n{sanitized_text[:120000]}"
                 )
 
-                raw_json = (response.text or "").strip()
-                # Clean any markdown if present
-                if raw_json.startswith("```"):
-                    raw_json = re.sub(r"^```(?:json)?\n|\n```$", "", raw_json, flags=re.MULTILINE).strip()
+            # Candidate models in priority order
+            candidate_models = [
+                self.model_name,
+                "gemini-3.8-flash",
+                "gemini-3.5-flash",
+            ]
+            seen_models = set()
+            models_to_try = []
+            for m in candidate_models:
+                if m and m not in seen_models:
+                    seen_models.add(m)
+                    models_to_try.append(m)
 
-                parsed = json.loads(raw_json)
-                return self._normalize_result(parsed)
+            last_error = None
+            for model_id in models_to_try:
+                for attempt in range(2):
+                    try:
+                        response = client.models.generate_content(
+                            model=model_id,
+                            contents=contents,
+                            config={
+                                "system_instruction": EXTRACTION_SYSTEM_PROMPT,
+                                "temperature": 0.1,
+                                "response_mime_type": "application/json",
+                            },
+                        )
 
-            except Exception as e:
-                logger.warning(f"Gemini API call failed ({e}). Falling back to intelligent heuristic extraction.")
+                        raw_json = (response.text or "").strip()
+                        if raw_json.startswith("```"):
+                            raw_json = re.sub(r"^```(?:json)?\n|\n```$", "", raw_json, flags=re.MULTILINE).strip()
 
-        # Fallback heuristic analyzer
+                        parsed = json.loads(raw_json)
+                        logger.info(f"Successfully analyzed '{filename}' using {model_id}")
+                        return self._normalize_result(parsed)
+
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(f"Gemini model {model_id} attempt {attempt+1} failed: {e}")
+                        if attempt == 0:
+                            await asyncio.sleep(1.2)
+
+            logger.error(f"All Gemini models failed for '{filename}'. Last error: {last_error}")
+
+            # For image files, DO NOT run text regex heuristics on placeholder strings!
+            if is_image:
+                return {
+                    "document_type": "Image Scan",
+                    "title": filename.replace(ext, "").replace("_", " ").title(),
+                    "summary": f"Image scan '{filename}' uploaded. AI vision processing temporarily unavailable due to upstream API capacity. Please click Re-analyze to retry.",
+                    "key_points": [
+                        f"Image scan uploaded ({ext.upper()})",
+                        "AI vision model was temporarily unavailable during upload. Use Re-analyze to generate insights."
+                    ],
+                    "entities": {},
+                    "line_items": [],
+                    "action_items": ["Click 'Re-analyze' to re-process visual intelligence."],
+                    "risk_clauses": [],
+                    "charts_data": {"chart_type": "none", "labels": [], "values": []},
+                    "raw_extracted_text": "",
+                    "confidence_score": 0.0,
+                }
+
+        # Fallback heuristic analyzer for plain text / PDF files
         return self._heuristic_analysis(sanitized_text, filename)
 
+    def _sanitize_box_2d(self, box: Any) -> list[int] | None:
+        """
+        Validates and sanitizes a 2D bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000 scale.
+        """
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return None
+        try:
+            coords = [int(round(float(c))) for c in box]
+            coords = [max(0, min(1000, c)) for c in coords]
+            ymin, xmin, ymax, xmax = coords
+            if ymax >= ymin and xmax >= xmin:
+                return coords
+            return None
+        except (ValueError, TypeError):
+            return None
+
+    def _unpack_compound_line_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        Decomposes compound macro-container items (e.g. 'Backend & Processing (FastAPI, PII Redaction Engine, Temporal...)')
+        into individual leaf items with proportional sub-boxes. Preserves the container while providing granular leaf targets.
+        """
+        unpacked: list[dict[str, Any]] = []
+        for it in items:
+            desc = (it.get("description") or "").strip()
+            box = it.get("box_2d")
+
+            paren_match = re.match(r"^([^(:\n]+?)\s*\(([^)]+)\)$", desc)
+            if paren_match and box and len(box) == 4 and ("," in paren_match.group(2) or ";" in paren_match.group(2)):
+                sub_parts = [s.strip() for s in re.split(r"[,;]+", paren_match.group(2)) if len(s.strip()) >= 2]
+                if len(sub_parts) >= 2:
+                    # Keep parent container
+                    unpacked.append(it)
+
+                    ymin, xmin, ymax, xmax = box
+                    h = ymax - ymin
+                    w = xmax - xmin
+                    n = len(sub_parts)
+                    is_vertical = h >= w
+                    for idx, part in enumerate(sub_parts):
+                        if is_vertical:
+                            step = h / n
+                            s_ymin = int(round(ymin + idx * step))
+                            s_ymax = int(round(ymin + (idx + 1) * step))
+                            sub_box = [s_ymin, xmin, s_ymax, xmax]
+                        else:
+                            step = w / n
+                            s_xmin = int(round(xmin + idx * step))
+                            s_xmax = int(round(xmin + (idx + 1) * step))
+                            sub_box = [ymin, s_xmin, ymax, s_xmax]
+
+                        sanitized_sub_box = self._sanitize_box_2d(sub_box)
+                        unpacked.append({
+                            "description": part,
+                            "quantity": 1,
+                            "amount": None,
+                            "box_2d": sanitized_sub_box if sanitized_sub_box else box,
+                        })
+                    continue
+
+            unpacked.append(it)
+        return unpacked
+
     def _normalize_result(self, data: dict[str, Any]) -> dict[str, Any]:
+        raw_entities = data.get("entities") or {}
+        normalized_entities = {}
+        if isinstance(raw_entities, dict):
+            for k, v in raw_entities.items():
+                if isinstance(v, dict):
+                    val = v.get("value")
+                    box = self._sanitize_box_2d(v.get("box_2d"))
+                    if box is not None:
+                        normalized_entities[k] = {
+                            "value": str(val) if val is not None else "",
+                            "box_2d": box,
+                        }
+                    else:
+                        normalized_entities[k] = val if val is not None else v
+                else:
+                    normalized_entities[k] = v
+        else:
+            normalized_entities = {}
+
+        raw_line_items = data.get("line_items") or []
+        normalized_line_items = []
+        if isinstance(raw_line_items, list):
+            for item in raw_line_items:
+                if isinstance(item, dict):
+                    clean_item = dict(item)
+                    if "box_2d" in clean_item:
+                        sanitized = self._sanitize_box_2d(clean_item["box_2d"])
+                        if sanitized is not None:
+                            clean_item["box_2d"] = sanitized
+                        else:
+                            clean_item.pop("box_2d", None)
+                    normalized_line_items.append(clean_item)
+
+        normalized_line_items = self._unpack_compound_line_items(normalized_line_items)
+
         return {
             "document_type": data.get("document_type") or "Document",
             "title": data.get("title") or "Untitled Document",
             "summary": data.get("summary") or "Document successfully processed.",
             "key_points": data.get("key_points") or [],
-            "entities": data.get("entities") or {},
-            "line_items": data.get("line_items") or [],
+            "entities": normalized_entities,
+            "line_items": normalized_line_items,
             "action_items": data.get("action_items") or [],
             "risk_clauses": data.get("risk_clauses") or [],
             "charts_data": data.get("charts_data") or {"chart_type": "none", "labels": [], "values": []},

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # AI Models
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
     EMBEDDING_MODEL: str = "gemini-embedding-001"
 
     # Storage
