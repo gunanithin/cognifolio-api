@@ -6,4 +6,7 @@ uploads/*
 !uploads/.gitkeep
 *.db
 .env
+*.env*
+*credentials*.json
+gcp-*.json
 qdrant_storage
