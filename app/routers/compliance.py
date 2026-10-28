@@ -32,8 +32,8 @@ def get_compliance_stats(
         audit_query = audit_query.filter(AuditLog.user_id == current_user.id)
 
     total_docs = doc_query.count()
-    total_audits = audit_query.count()
-    all_logs = audit_query.all()
+    all_logs = audit_query.with_entities(AuditLog.action, AuditLog.meta).all()
+    total_audits = len(all_logs)
 
     # Aggregate PII detections across scoped logs
     pii_counts: Dict[str, int] = {
@@ -158,7 +158,7 @@ def trigger_document_redaction(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
 
-    redacted_path = redactor.get_or_create_redacted_pdf(doc.id, doc.file_path)
+    redacted_path = redactor.get_or_create_redacted_pdf(str(doc.id), str(doc.file_path))
 
     log_audit_event(
         db=db,
@@ -167,7 +167,7 @@ def trigger_document_redaction(
         target_id=str(doc.id),
         user_id=str(current_user.id),
         metadata={
-            "filename": doc.original_filename,
+            "filename": str(doc.original_filename),
             "redacted_file": redacted_path,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
@@ -175,8 +175,8 @@ def trigger_document_redaction(
 
     return {
         "success": True,
-        "document_id": doc.id,
-        "filename": doc.original_filename,
+        "document_id": str(doc.id),
+        "filename": str(doc.original_filename),
         "redacted_path": redacted_path,
         "message": "Physical PDF redaction successfully applied and audited.",
     }

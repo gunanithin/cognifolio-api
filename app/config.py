@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # AI Models
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
     EMBEDDING_MODEL: str = "gemini-embedding-001"
 
     # Storage
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     GCS_CREDENTIALS_FILE: str = ""  # path to service account JSON, e.g. ./gcp-credentials.json
     GCS_CREDENTIALS_JSON: str = ""  # inline JSON string for container/cloud deploys
     UPLOAD_DIR: str = "./uploads"
-    MAX_FILE_SIZE_MB: int = 25
+    MAX_FILE_SIZE_MB: int = 50
     ALLOWED_EXTENSIONS: str = "pdf,png,jpg,jpeg,webp,docx,doc,xlsx,xls,csv,txt,md"
 
     @property
