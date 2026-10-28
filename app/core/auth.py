@@ -1,4 +1,5 @@
-from typing import Optional, List
+import time
+from typing import Optional, List, Dict, Tuple
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
@@ -11,6 +12,10 @@ from app.core.security import decode_access_token
 # Enterprise bearer token scheme
 security = HTTPBearer(auto_error=False)
 
+# In-memory user cache to eliminate redundant remote DB roundtrips on concurrent requests
+_USER_CACHE: Dict[str, Tuple[float, User]] = {}
+_USER_CACHE_TTL = 60.0
+
 
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -19,6 +24,7 @@ def get_current_user(
     """
     Strict authentication dependency.
     Validates JWT token, verifies signature and expiration, and retrieves active user.
+    Uses 60s in-memory session cache for sub-millisecond repeated request handling.
     """
     if not credentials or not credentials.credentials:
         raise HTTPException(
@@ -44,12 +50,22 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Check fast in-memory user cache
+    now = time.time()
+    if user_id in _USER_CACHE:
+        cached_time, cached_user = _USER_CACHE[user_id]
+        if now - cached_time < _USER_CACHE_TTL:
+            try:
+                return db.merge(cached_user, load=False)
+            except Exception:
+                pass
+
     # Resolve user in database
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         # Check if this was a valid guest token whose record needs to be initialized
         role = payload.get("role", "guest")
-        if role == "guest" or str(user_id).startswith("guest_"):
+        if role == "guest" or user_id.startswith("guest_"):
             guest_email = payload.get("email") or f"{user_id}@guest.cognifolio.ai"
             user = User(
                 id=user_id,
@@ -67,6 +83,9 @@ def get_current_user(
                 detail="User account associated with this token was not found.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+    if user:
+        _USER_CACHE[user_id] = (now, user)
 
     return user
 

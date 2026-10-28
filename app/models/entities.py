@@ -60,7 +60,13 @@ class Document(Base):
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="documents")
-    insights: Mapped[Optional["DocumentInsight"]] = relationship("DocumentInsight", back_populates="document", uselist=False, cascade="all, delete-orphan")
+    insights: Mapped[Optional["DocumentInsight"]] = relationship(
+        "DocumentInsight",
+        back_populates="document",
+        uselist=False,
+        lazy="joined",
+        cascade="all, delete-orphan",
+    )
 
 
 class DocumentInsight(Base):

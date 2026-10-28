@@ -1,12 +1,28 @@
+import json
 import re
+import time
+from typing import Dict, Any, Tuple
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from app.database import get_db
 from app.models.entities import Document, DocumentInsight, User
 from app.core import get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+# In-memory TTL cache to eliminate redundant remote DB roundtrips on rapid navigation
+_STATS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CACHE_TTL_SECONDS = 15.0
+
+
+def invalidate_dashboard_cache(user_id: str | None = None):
+    """Call when documents are uploaded or deleted to instantly refresh stats."""
+    global _STATS_CACHE
+    if user_id:
+        _STATS_CACHE.pop(user_id, None)
+    else:
+        _STATS_CACHE.clear()
 
 
 @router.get("/stats")
@@ -16,15 +32,26 @@ def get_dashboard_stats(
 ):
     """
     Returns aggregated metrics and charts dataset scoped strictly to the authenticated user.
+    Uses optimized single-roundtrip queries and low-TTL caching for sub-second page loads.
     """
-    doc_query = db.query(Document)
+    cache_key = f"{current_user.id}_{current_user.role}"
+    now = time.time()
+    if cache_key in _STATS_CACHE:
+        cached_time, cached_payload = _STATS_CACHE[cache_key]
+        if now - cached_time < _CACHE_TTL_SECONDS:
+            return cached_payload
+
+    # 1. Total & ready count in a single query roundtrip
+    stats_query = db.query(
+        func.count(Document.id),
+        func.count(func.nullif(Document.status != "ready", True)),
+    )
     if current_user.role != "admin":
-        doc_query = doc_query.filter(Document.user_id == current_user.id)
+        stats_query = stats_query.filter(Document.user_id == current_user.id)
 
-    total_docs = doc_query.count()
-    ready_docs = doc_query.filter(Document.status == "ready").count()
+    total_docs, ready_docs = stats_query.first() or (0, 0)
 
-    # Aggregate by document type for current user
+    # 2. Document type breakdown
     type_query = (
         db.query(DocumentInsight.document_type, func.count(DocumentInsight.id))
         .join(Document, Document.id == DocumentInsight.document_id)
@@ -35,8 +62,11 @@ def get_dashboard_stats(
     type_counts = type_query.group_by(DocumentInsight.document_type).all()
     doc_types_breakdown = {t: c for t, c in type_counts if t}
 
-    # Aggregate recent documents for current user
-    recent_query = db.query(Document)
+    # 3. Recent documents with joinedload (zero N+1 queries)
+    recent_query = (
+        db.query(Document)
+        .options(joinedload(Document.insights))
+    )
     if current_user.role != "admin":
         recent_query = recent_query.filter(Document.user_id == current_user.id)
 
@@ -60,18 +90,19 @@ def get_dashboard_stats(
             "summary": (insight.summary[:140] + "...") if (insight and insight.summary) else "Processing...",
         })
 
-    # Auto-compile vendor/category chart data from invoices & contracts belonging to user
-    insights_query = db.query(DocumentInsight).join(Document, Document.id == DocumentInsight.document_id)
+    # 4. Vendor spending breakdown: query ONLY the entities JSON column (avoids pulling raw text)
+    insights_query = (
+        db.query(DocumentInsight.entities)
+        .join(Document, Document.id == DocumentInsight.document_id)
+    )
     if current_user.role != "admin":
         insights_query = insights_query.filter(Document.user_id == current_user.id)
 
-    all_insights = insights_query.all()
+    entities_rows = insights_query.all()
     vendor_spending = {}
-    for ins in all_insights:
-        entities = ins.entities
+    for (entities,) in entities_rows:
         if isinstance(entities, str):
             try:
-                import json
                 entities = json.loads(entities)
             except Exception:
                 entities = {}
@@ -91,7 +122,7 @@ def get_dashboard_stats(
                 except ValueError:
                     pass
 
-    return {
+    payload = {
         "overview": {
             "total_documents": total_docs,
             "processed_successfully": ready_docs,
@@ -109,3 +140,6 @@ def get_dashboard_stats(
         },
         "recent_documents": recent_items,
     }
+
+    _STATS_CACHE[cache_key] = (now, payload)
+    return payload

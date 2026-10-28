@@ -27,6 +27,7 @@ def log_audit_event(
     user_id: Optional[str] = None,
     org_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    commit: bool = True,
 ) -> AuditLog:
     """
     Records an immutable audit event in the database for SOC2 / GDPR compliance.
@@ -50,6 +51,7 @@ def log_audit_event(
         meta=meta,
     )
     db.add(audit_entry)
-    db.commit()
-    db.refresh(audit_entry)
+    if commit:
+        db.commit()
+        db.refresh(audit_entry)
     return audit_entry
