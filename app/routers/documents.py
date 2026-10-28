@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -20,6 +20,7 @@ from app.services.audit import log_audit_event
 from app.services.gemini import gemini_analyzer
 from app.services.pdf_extractor import extractor
 from app.services.redactor import redactor
+from app.services.storage import storage_service
 from app.services.vector_db import vector_service
 
 router = APIRouter(prefix="/documents", tags=["Documents & Multimodal Intelligence"])
@@ -105,14 +106,22 @@ async def upload_document(
 
     doc_id = str(uuid.uuid4())
     stored_filename = f"{doc_id}_{safe_filename}"
-    file_path = os.path.join(settings.UPLOAD_DIR, stored_filename)
+    temp_file_path = os.path.join(settings.UPLOAD_DIR, stored_filename)
 
-    # Save physical file
+    # Save physical file temporarily for local extraction and upload to GCS/Storage
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-    with open(file_path, "wb") as buffer:
+    with open(temp_file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    file_size = os.path.getsize(file_path)
+    file_size = os.path.getsize(temp_file_path)
+
+    # Upload to persistent storage (Google Cloud Storage or local disk)
+    gcs_dest_path = f"documents/{current_user.id}/{doc_id}/{safe_filename}"
+    storage_path = storage_service.upload_file(
+        temp_file_path,
+        gcs_dest_path,
+        content_type=file.content_type,
+    )
 
     # Scoped strictly to current_user
     doc = Document(
@@ -120,7 +129,7 @@ async def upload_document(
         user_id=current_user.id,
         filename=stored_filename,
         original_filename=safe_filename,
-        file_path=file_path,
+        file_path=storage_path,
         file_size_bytes=file_size,
         file_type=ext,
         mime_type=file.content_type,
@@ -133,7 +142,8 @@ async def upload_document(
     db.refresh(doc)
 
     # 1. Extraction
-    extraction_res = extractor.extract(file_path)
+    local_extraction_path = storage_service.download_to_temp(storage_path)
+    extraction_res = extractor.extract(local_extraction_path)
     raw_text = extraction_res["text"]
     page_count = extraction_res["page_count"]
     is_scanned = extraction_res["is_scanned"]
@@ -141,17 +151,20 @@ async def upload_document(
     # 2. PII Redaction
     sanitized_text, pii_stats = redactor.redact(raw_text)
 
-    # Pre-generate physically redacted file (PDF, Image, or Text)
+    # Pre-generate physically redacted file (PDF, Image, or Text) & persist to GCS
     try:
-        redactor.get_or_create_redacted_file(doc_id, file_path)
+        redacted_local = redactor.get_or_create_redacted_file(doc_id, local_extraction_path)
+        if storage_service.is_gcs_active and os.path.exists(redacted_local):
+            redacted_gcs_dest = f"documents/{current_user.id}/{doc_id}/redacted_{safe_filename}"
+            storage_service.upload_file(redacted_local, redacted_gcs_dest)
     except Exception:
         pass
 
-    # 3. AI Analysis (Gemini 3.5 Flash)
+    # 3. AI Analysis (Gemini Flash)
     ai_insights = await gemini_analyzer.analyze_document(
         sanitized_text=sanitized_text,
         filename=safe_filename,
-        file_path=file_path,
+        file_path=local_extraction_path,
         is_scanned=is_scanned,
     )
 
@@ -342,7 +355,10 @@ def list_documents(
         query = query.join(DocumentInsight).filter(DocumentInsight.document_type == doc_type)
 
     docs = query.order_by(Document.uploaded_at.desc()).all()
-    valid_docs = [d for d in docs if os.path.exists(str(d.file_path))]
+    valid_docs = [
+        d for d in docs
+        if str(d.file_path).startswith("gs://") or os.path.exists(str(d.file_path)) or not d.file_path
+    ]
     return {"total": len(valid_docs), "items": valid_docs}
 
 
@@ -378,12 +394,13 @@ async def reanalyze_document(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
 
-    file_path = doc.file_path
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Physical document file missing on disk.")
+    try:
+        local_path = storage_service.download_to_temp(doc.file_path)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Physical document file missing on storage.")
 
     # 1. Extraction
-    extraction_res = extractor.extract(file_path)
+    extraction_res = extractor.extract(local_path)
     raw_text = extraction_res["text"]
     page_count = extraction_res["page_count"]
     is_scanned = extraction_res["is_scanned"]
@@ -395,7 +412,7 @@ async def reanalyze_document(
     ai_insights = await gemini_analyzer.analyze_document(
         sanitized_text=sanitized_text,
         filename=doc.original_filename,
-        file_path=file_path,
+        file_path=local_path,
         is_scanned=is_scanned,
     )
 
@@ -482,6 +499,7 @@ def get_document_file(
 ):
     """
     Streams original document file. Resolves authentication via header or ?token= param.
+    Streams directly from Google Cloud Storage (GCS) or local disk.
     """
     caller = resolve_file_user(token=token, current_user=current_user, db=db)
 
@@ -492,11 +510,13 @@ def get_document_file(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on storage.")
 
     file_path = str(doc.file_path)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on storage.")
-
     original_filename = str(doc.original_filename)
     mime_type = str(doc.mime_type) if doc.mime_type else "application/octet-stream"
+
+    try:
+        data, content_type = storage_service.get_file_bytes(file_path)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on storage.")
 
     # Record view audit trail
     log_audit_event(
@@ -508,10 +528,10 @@ def get_document_file(
         metadata={"filename": original_filename, "mime_type": mime_type},
     )
 
-    return FileResponse(
-        file_path,
-        media_type=mime_type,
-        filename=original_filename,
+    return Response(
+        content=data,
+        media_type=mime_type or content_type,
+        headers={"Content-Disposition": f'inline; filename="{original_filename}"'},
     )
 
 
@@ -535,13 +555,18 @@ def get_redacted_document_file(
 
     doc_id = str(doc.id)
     file_path = str(doc.file_path)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source document not found.")
-
     original_filename = str(doc.original_filename)
-    redacted_path = redactor.get_or_create_redacted_file(doc_id, file_path)
-    if not os.path.exists(redacted_path):
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to locate or generate redacted document.")
+
+    try:
+        local_path = storage_service.download_to_temp(file_path)
+        redacted_path = redactor.get_or_create_redacted_file(doc_id, local_path)
+        if not os.path.exists(redacted_path):
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to locate or generate redacted document.")
+
+        with open(redacted_path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to load redacted file: {e}")
 
     # Record audit trail
     log_audit_event(
@@ -568,10 +593,10 @@ def get_redacted_document_file(
     elif redacted_ext in [".txt", ".md"]:
         media_type = "text/plain; charset=utf-8"
 
-    return FileResponse(
-        redacted_path,
+    return Response(
+        content=data,
         media_type=media_type,
-        filename=download_filename,
+        headers={"Content-Disposition": f'inline; filename="{download_filename}"'},
     )
 
 
@@ -584,6 +609,7 @@ def delete_document(
 ):
     """
     Idempotent deletion scoped strictly to the caller's documents.
+    Removes files from Google Cloud Storage or local disk and purges metadata.
     """
     try:
         query = db.query(Document).filter(Document.id == document_id)
@@ -601,18 +627,15 @@ def delete_document(
     file_path = str(doc.file_path)
     original_filename = str(doc.original_filename)
 
-    # Remove physical original file
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
+    # Remove physical original file from GCS or local disk
+    storage_service.delete_file(file_path)
 
     # Remove redacted file if generated
-    redacted_path = os.path.join(settings.UPLOAD_DIR, f"{doc_id}_redacted.pdf")
-    if os.path.exists(redacted_path):
+    storage_service.delete_file(f"documents/{doc.user_id}/{doc_id}/redacted_{original_filename}")
+    redacted_local = os.path.join(settings.UPLOAD_DIR, f"{doc_id}_redacted.pdf")
+    if os.path.exists(redacted_local):
         try:
-            os.remove(redacted_path)
+            os.remove(redacted_local)
         except Exception:
             pass
 

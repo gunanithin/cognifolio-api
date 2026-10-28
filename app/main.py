@@ -41,11 +41,17 @@ api_v1.include_router(compliance.router)
 
 @api_v1.get("/health")
 def api_v1_health():
+    from app.services.storage import storage_service
     return {
         "status": "online",
         "env": settings.APP_ENV,
         "gemini_model": settings.GEMINI_MODEL,
         "qdrant_location": settings.QDRANT_LOCATION,
+        "storage": {
+            "provider": "gcs" if storage_service.is_gcs_active else "local",
+            "bucket": settings.GCS_BUCKET_NAME if storage_service.is_gcs_active else None,
+            "active": storage_service.is_gcs_active,
+        },
     }
 
 

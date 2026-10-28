@@ -12,6 +12,10 @@ ENV/
 # Sensitive Environment Variables & Secrets
 .env
 *.env.local
+*credentials*.json
+*service_account*.json
+gcp-*.json
+*.pem
 
 # Uploaded Files & Temporary Storage
 uploads/
