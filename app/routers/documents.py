@@ -42,6 +42,22 @@ def resolve_file_user(
             user_id = payload.get("sub")
             if user_id:
                 user = db.query(User).filter(User.id == user_id).first()
+                if not user:
+                    user = db.query(User).filter(User.email == user_id).first()
+                if not user:
+                    role = payload.get("role", "guest")
+                    if role == "guest" or str(user_id).startswith("guest_"):
+                        guest_email = payload.get("email") or f"{user_id}@guest.cognifolio.ai"
+                        user = User(
+                            id=user_id,
+                            email=guest_email,
+                            name="Guest Analyst",
+                            role="guest",
+                            is_guest=True,
+                        )
+                        db.add(user)
+                        db.commit()
+                        db.refresh(user)
                 if user:
                     return user
         except Exception:
@@ -52,6 +68,20 @@ def resolve_file_user(
         detail="Authentication required to view document file.",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def scope_document_query(query, caller: User):
+    """
+    Applies multi-tenant document scoping rules:
+    - Admin: Full visibility across all tenant documents.
+    - Guest: Access to own uploads and shared guest playground documents.
+    - Analyst / Standard User: Strict isolation to caller's own user_id.
+    """
+    if caller.role == "admin":
+        return query
+    if caller.is_guest:
+        return query.filter((Document.user_id == caller.id) | (Document.user.has(is_guest=True)))
+    return query.filter(Document.user_id == caller.id)
 
 
 @router.post("/upload", response_model=DocumentResponse)
@@ -302,9 +332,7 @@ def list_documents(
     """
     Lists indexed documents strictly scoped to the active user.
     """
-    query = db.query(Document)
-    if current_user.role != "admin":
-        query = query.filter(Document.user_id == current_user.id)
+    query = scope_document_query(db.query(Document), current_user)
 
     if status:
         query = query.filter(Document.status == status)
@@ -312,7 +340,8 @@ def list_documents(
         query = query.join(DocumentInsight).filter(DocumentInsight.document_type == doc_type)
 
     docs = query.order_by(Document.uploaded_at.desc()).all()
-    return {"total": len(docs), "items": docs}
+    valid_docs = [d for d in docs if os.path.exists(str(d.file_path))]
+    return {"total": len(valid_docs), "items": valid_docs}
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)
@@ -324,9 +353,7 @@ def get_document(
     """
     Retrieves document metadata ensuring tenant ownership.
     """
-    query = db.query(Document).filter(Document.id == document_id)
-    if current_user.role != "admin":
-        query = query.filter(Document.user_id == current_user.id)
+    query = scope_document_query(db.query(Document).filter(Document.id == document_id), current_user)
 
     doc = query.first()
     if not doc:
@@ -346,9 +373,7 @@ def get_document_file(
     """
     caller = resolve_file_user(token=token, current_user=current_user, db=db)
 
-    query = db.query(Document).filter(Document.id == document_id)
-    if caller.role != "admin":
-        query = query.filter(Document.user_id == caller.id)
+    query = scope_document_query(db.query(Document).filter(Document.id == document_id), caller)
 
     doc = query.first()
     if not doc:
@@ -390,9 +415,7 @@ def get_redacted_document_file(
     """
     caller = resolve_file_user(token=token, current_user=current_user, db=db)
 
-    query = db.query(Document).filter(Document.id == document_id)
-    if caller.role != "admin":
-        query = query.filter(Document.user_id == caller.id)
+    query = scope_document_query(db.query(Document).filter(Document.id == document_id), caller)
 
     doc = query.first()
     if not doc:
@@ -511,9 +534,7 @@ async def chat_with_document(
     Conversational RAG assistant grounded strictly in the target document.
     Enforces tenant access verification.
     """
-    query = db.query(Document).filter(Document.id == document_id)
-    if current_user.role != "admin":
-        query = query.filter(Document.user_id == current_user.id)
+    query = scope_document_query(db.query(Document).filter(Document.id == document_id), current_user)
 
     doc = query.first()
     if not doc:
