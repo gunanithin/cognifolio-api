@@ -253,7 +253,7 @@ cp .env.example .env
 | `GCS_PROJECT_ID` | Google Cloud Platform Project ID | `cognifolio` |
 | `GCS_CREDENTIALS_FILE`| Path to Google Cloud Service Account JSON key | `./gcp-credentials.json` |
 | `UPLOAD_DIR` | Local disk directory (used when provider is `local`) | `./uploads` |
-| `MAX_FILE_SIZE_MB` | Maximum allowed file upload size in megabytes | `25` |
+| `MAX_FILE_SIZE_MB` | Maximum allowed file upload size in megabytes | `50` |
 | `ALLOWED_EXTENSIONS`| Single source of truth for allowed file extensions | `pdf,png,jpg,jpeg,webp,docx,doc,xlsx,xls,csv,txt,md` |
 
 ---
