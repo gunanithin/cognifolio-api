@@ -75,17 +75,13 @@ def resolve_file_user(
 
 def scope_document_query(query, caller: User):
     """
-    Applies multi-tenant document scoping rules:
+    Applies multi-tenant zero-trust document scoping rules:
     - Admin: Full visibility across all tenant documents.
-    - Guest: Access to own uploads and shared guest playground documents.
-    - Analyst / Standard User: Strict isolation to caller's own user_id.
+    - All Users & Guests: Strict isolation to caller's own user_id.
+      Prevents any cross-user or cross-visitor document leakage.
     """
     if caller.role == "admin":
         return query
-    if caller.is_guest:
-        return query.join(User, Document.user_id == User.id).filter(
-            (Document.user_id == caller.id) | (User.is_guest == True)
-        )
     return query.filter(Document.user_id == caller.id)
 
 
