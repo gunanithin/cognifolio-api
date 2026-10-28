@@ -1,10 +1,12 @@
+import os
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+
 from app.config import settings
-from app.database import engine, Base
-from app.routers import documents, search, dashboard, compliance, auth
+from app.database import Base, engine
+from app.routers import auth, compliance, dashboard, documents, search
 
 
 @asynccontextmanager
@@ -49,8 +51,14 @@ def api_v1_health():
         "qdrant_location": settings.QDRANT_LOCATION,
         "storage": {
             "provider": "gcs" if storage_service.is_gcs_active else "local",
-            "bucket": settings.GCS_BUCKET_NAME if storage_service.is_gcs_active else None,
+            "bucket": (
+                getattr(settings, "GCS_BUCKET_NAME", None)
+                or getattr(settings, "GCS_BUCKET", None)
+                or os.environ.get("GCS_BUCKET_NAME", None)
+                or os.environ.get("GCS_BUCKET", None)
+            ) if storage_service.is_gcs_active else None,
             "active": storage_service.is_gcs_active,
+            "diagnostic": "Connected to Google Cloud Storage" if storage_service.is_gcs_active else (storage_service.init_error or "GCS inactive, using local fallback"),
         },
     }
 
