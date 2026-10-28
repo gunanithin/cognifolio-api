@@ -15,6 +15,16 @@ from app.core import get_current_user
 router = APIRouter(prefix="/compliance", tags=["Compliance & Audit"])
 
 
+VALID_COMPLIANCE_ACTIONS = {
+    "uploaded",
+    "redacted",
+    "viewed_redacted",
+    "deleted",
+    "exported",
+    "document_comparison",
+}
+
+
 @router.get("/stats")
 def get_compliance_stats(
     db: Session = Depends(get_db),
@@ -50,7 +60,7 @@ def get_compliance_stats(
     for log in all_logs:
         act = log.action
         action_breakdown[act] = action_breakdown.get(act, 0) + 1
-        
+
         meta = log.meta or {}
         pii_dict = meta.get("pii_redacted") or meta.get("pii_stats") or {}
         if isinstance(pii_dict, dict):
@@ -61,13 +71,18 @@ def get_compliance_stats(
                     pii_counts[k] = pii_counts.get(k, 0) + count
 
     total_pii_masked = sum(pii_counts.values())
+    valid_logs_count = sum(
+        count for act, count in action_breakdown.items() if act in VALID_COMPLIANCE_ACTIONS
+    )
     compliance_score = 99.2 if total_audits > 0 else 95.0
 
     return {
         "compliance_score": compliance_score,
         "status": "Enterprise Compliant (SOC2 / GDPR)",
         "total_documents": total_docs,
-        "total_audit_events": total_audits,
+        "total_audit_events": valid_logs_count if valid_logs_count > 0 else total_audits,
+        "raw_audit_events": total_audits,
+        "valid_audit_events": valid_logs_count,
         "total_pii_masked": total_pii_masked,
         "pii_breakdown": pii_counts,
         "action_breakdown": action_breakdown,
@@ -85,20 +100,28 @@ def get_compliance_stats(
 def list_audit_logs(
     action: Optional[str] = Query(None, description="Filter by event action"),
     search: Optional[str] = Query(None, description="Search term in target or metadata"),
-    limit: int = Query(50, ge=1, le=500),
+    limit: int = Query(25, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Returns paginated, searchable immutable audit trail events strictly scoped to caller.
+    Filters out background session noise by default so only valid compliance records are returned.
     """
     query = db.query(AuditLog)
 
     if current_user.role != "admin":
         query = query.filter(AuditLog.user_id == current_user.id)
 
-    if action and action != "all":
+    # Filter out noisy internal background events (like guest_session_created) by default
+    if action in ("valid", "compliance", None, ""):
+        query = query.filter(AuditLog.action.in_(VALID_COMPLIANCE_ACTIONS))
+    elif action == "all":
+        query = query.filter(AuditLog.action != "guest_session_created")
+    elif action == "all_raw":
+        pass
+    else:
         query = query.filter(AuditLog.action == action)
 
     logs = query.order_by(AuditLog.created_at.desc()).all()
