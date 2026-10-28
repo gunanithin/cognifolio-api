@@ -156,11 +156,13 @@ async def upload_document(
     )
 
     # If image transcription was performed by Gemini, capture it in sanitized_text & index
-    if ai_insights.get("raw_extracted_text") and (not raw_text or raw_text.startswith("[Scanned Image")):
+    if ai_insights.get("raw_extracted_text"):
         gemini_text = ai_insights["raw_extracted_text"]
         sanitized_text, extra_pii = redactor.redact(gemini_text)
         for k, v in extra_pii.items():
             pii_stats[k] = pii_stats.get(k, 0) + v
+    elif raw_text and raw_text.startswith("[Scanned Image"):
+        sanitized_text = ""
 
     # 4. Save Insights in DB
     insight = DocumentInsight(
@@ -358,6 +360,116 @@ def get_document(
     doc = query.first()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
+    return doc
+
+
+@router.post("/{document_id}/reanalyze", response_model=DocumentResponse)
+async def reanalyze_document(
+    document_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    """
+    Forces deep multimodal AI re-analysis on an existing document,
+    updating its structured insights, spatial bounding coordinates, and vector embeddings.
+    """
+    query = scope_document_query(db.query(Document).filter(Document.id == document_id), current_user)
+    doc = query.first()
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found or access denied.")
+
+    file_path = doc.file_path
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Physical document file missing on disk.")
+
+    # 1. Extraction
+    extraction_res = extractor.extract(file_path)
+    raw_text = extraction_res["text"]
+    page_count = extraction_res["page_count"]
+    is_scanned = extraction_res["is_scanned"]
+
+    # 2. PII Redaction
+    sanitized_text, pii_stats = redactor.redact(raw_text)
+
+    # 3. Multimodal AI Analysis with retry and model fallback
+    ai_insights = await gemini_analyzer.analyze_document(
+        sanitized_text=sanitized_text,
+        filename=doc.original_filename,
+        file_path=file_path,
+        is_scanned=is_scanned,
+    )
+
+    if ai_insights.get("raw_extracted_text"):
+        gemini_text = ai_insights["raw_extracted_text"]
+        sanitized_text, extra_pii = redactor.redact(gemini_text)
+        for k, v in extra_pii.items():
+            pii_stats[k] = pii_stats.get(k, 0) + v
+    elif raw_text and raw_text.startswith("[Scanned Image"):
+        sanitized_text = ""
+
+    # 4. Upsert DocumentInsight
+    existing_insight = db.query(DocumentInsight).filter(DocumentInsight.document_id == doc.id).first()
+    if existing_insight:
+        existing_insight.document_type = ai_insights["document_type"]
+        existing_insight.title = ai_insights["title"]
+        existing_insight.summary = ai_insights["summary"]
+        existing_insight.key_points = ai_insights["key_points"]
+        existing_insight.entities = ai_insights["entities"]
+        existing_insight.line_items = ai_insights["line_items"]
+        existing_insight.action_items = ai_insights["action_items"]
+        existing_insight.risk_clauses = ai_insights["risk_clauses"]
+        existing_insight.charts_data = ai_insights["charts_data"]
+        existing_insight.raw_extracted_text = sanitized_text
+        existing_insight.confidence_score = ai_insights["confidence_score"]
+    else:
+        new_insight = DocumentInsight(
+            id=str(uuid.uuid4()),
+            document_id=doc.id,
+            document_type=ai_insights["document_type"],
+            title=ai_insights["title"],
+            summary=ai_insights["summary"],
+            key_points=ai_insights["key_points"],
+            entities=ai_insights["entities"],
+            line_items=ai_insights["line_items"],
+            action_items=ai_insights["action_items"],
+            risk_clauses=ai_insights["risk_clauses"],
+            charts_data=ai_insights["charts_data"],
+            raw_extracted_text=sanitized_text,
+            confidence_score=ai_insights["confidence_score"],
+        )
+        db.add(new_insight)
+
+    doc.page_count = page_count
+    doc.processed_at = datetime.now(timezone.utc)
+    doc.status = "ready"
+    db.commit()
+    db.refresh(doc)
+
+    # 5. Update vector indexing
+    searchable_blob = f"{ai_insights['title']}\n{ai_insights['summary']}\n{' '.join(ai_insights['key_points'])}\n{sanitized_text[:4000]}"
+    vector_service.upsert_document(
+        doc_id=str(doc.id),
+        text=searchable_blob,
+        metadata={
+            "document_id": str(doc.id),
+            "filename": doc.original_filename,
+            "document_type": ai_insights["document_type"],
+            "user_id": str(current_user.id),
+            "title": ai_insights["title"],
+            "summary": ai_insights["summary"][:250],
+            "uploaded_at": doc.uploaded_at.isoformat() if doc.uploaded_at else "",
+        },
+    )
+
+    log_audit_event(
+        db=db,
+        action="reanalyzed",
+        target_type="document",
+        target_id=str(doc.id),
+        user_id=str(current_user.id),
+        metadata={"filename": doc.original_filename, "confidence_score": ai_insights["confidence_score"]},
+    )
+
     return doc
 
 

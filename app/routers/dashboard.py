@@ -77,12 +77,17 @@ def get_dashboard_stats(
                 entities = {}
         if entities and isinstance(entities, dict):
             vendor = entities.get("vendor_or_issuer")
+            if isinstance(vendor, dict):
+                vendor = vendor.get("value")
             amt_str = entities.get("total_amount")
+            if isinstance(amt_str, dict):
+                amt_str = amt_str.get("value")
             if vendor and amt_str:
                 clean_num = re.sub(r"[^\d.]", "", str(amt_str))
                 try:
                     val = float(clean_num)
-                    vendor_spending[vendor] = vendor_spending.get(vendor, 0.0) + val
+                    vendor_key = str(vendor)
+                    vendor_spending[vendor_key] = vendor_spending.get(vendor_key, 0.0) + val
                 except ValueError:
                     pass
 
