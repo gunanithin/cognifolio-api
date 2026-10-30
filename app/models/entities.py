@@ -101,3 +101,38 @@ class AuditLog(Base):
     target_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     meta: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ErrorLog(Base):
+    __tablename__ = "error_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    correlation_id: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+    # Dimension 1: Actor Persona Segregation
+    user_type: Mapped[str] = mapped_column(String(20), default="guest", index=True)  # 'guest' | 'authenticated' | 'system'
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    user_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Dimension 2: Subsystem & Functional Domain
+    subsystem: Mapped[str] = mapped_column(String(50), default="general", index=True)
+
+    # Dimension 3: Severity Level
+    severity: Mapped[str] = mapped_column(String(20), default="ERROR", index=True)  # 'CRITICAL' | 'ERROR' | 'WARNING' | 'INFO'
+
+    # HTTP & Network Context
+    endpoint: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    http_method: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    error_code: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Presentation Segregation
+    user_friendly_message: Mapped[str] = mapped_column(String(500), nullable=False)
+    technical_message: Mapped[str] = mapped_column(Text, nullable=False)
+    stack_trace: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Environment & Audit Payloads
+    client_context: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    request_payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+

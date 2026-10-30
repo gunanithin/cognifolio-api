@@ -1,3 +1,4 @@
+import hashlib
 import datetime
 from datetime import timedelta, timezone
 from typing import Optional, Any, Dict
@@ -9,11 +10,23 @@ JWT_ALGORITHM = "HS256"
 DEFAULT_ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES or 1440  # 24 hours default
 
 
+def prepare_password_bytes(password: str) -> bytes:
+    """
+    Bcrypt has a hard limit of 72 bytes.
+    If password exceeds 72 bytes (e.g. long passphrases or derived tokens),
+    we apply SHA-256 (producing a fixed 32-byte binary digest) per OWASP recommendations.
+    """
+    pwd_bytes = password.encode("utf-8")
+    if len(pwd_bytes) > 72:
+        return hashlib.sha256(pwd_bytes).digest()
+    return pwd_bytes
+
+
 def hash_password(password: str) -> str:
     """
     Enterprise-grade password hashing using bcrypt with 12 salt rounds.
     """
-    password_bytes = password.encode("utf-8")
+    password_bytes = prepare_password_bytes(password)
     salt = bcrypt.gensalt(rounds=12)
     return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
 
@@ -23,8 +36,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     Constant-time password comparison to prevent timing attacks.
     """
     try:
+        prepared = prepare_password_bytes(plain_password)
         return bcrypt.checkpw(
-            plain_password.encode("utf-8"),
+            prepared,
             hashed_password.encode("utf-8"),
         )
     except Exception:
@@ -32,7 +46,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def create_access_token(
-    subject: str,
+    subject: Any,
     role: str = "analyst",
     expires_delta: Optional[timedelta] = None,
     extra_claims: Optional[Dict[str, Any]] = None,
