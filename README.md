@@ -149,10 +149,12 @@ Cognifolio operates under a strict **Zero-Trust Client-Side Redaction Mandate**.
 
 | Security Measure | Implementation Mechanism | Enterprise Benefit |
 | :--- | :--- | :--- |
+| **Zero-Knowledge Auth** | Server advertises RSA-2048 public key; client encrypts credentials via hybrid RSA+AES envelope. | Plaintext passwords never cross the wire or enter server-side gateway logs. |
 | **Pre-AI Masking** | `PIIRedactor.redact()` executed on all raw extracted text before prompt interpolation. | Guarantees compliance with GDPR, HIPAA, and DPDP by preventing external model ingestion of sensitive credentials. |
 | **Physical Burn-In** | Overlay engine draws opaque blackout polygons on PDF canvases and image headers. | Redacted files can be safely shared with third parties without risk of underlying text scraping. |
 | **Multi-Tenant Isolation** | Every SQL query, vector upsert, and GCS object path is scoped strictly to `current_user.id`. | Prevents data cross-contamination between enterprise tenants or user accounts. |
 | **Cryptographic Audit** | `log_audit_event()` persists every file view, redaction generation, vector query, and purge. | Provides a tamper-evident audit log for SOC 2, ISO 27001, and regulatory compliance reviews. |
+| **Telemetry Error Logs** | Centralized `public.error_logs` in Supabase PostgreSQL tracks correlation IDs, stack traces, and p95 latencies. | Empowers developers to triage incidents rapidly without exposing raw technical errors to standard users. |
 | **Secret Zero-Leakage** | All credentials (`gcp-credentials.json`, `.env`, API keys) are strictly `.gitignore`d. | Eliminates exposure of infrastructure credentials in version control. |
 
 ---
@@ -213,7 +215,87 @@ Traditional OCR engines group large diagram sections or multi-item columns into 
 
 ---
 
-## 7. Supported Multi-Format Ingestion
+## 7. Zero-Knowledge Authentication & Multi-Role RBAC
+
+Cognifolio API employs a Zero-Knowledge credential architecture where plaintext passwords are never transmitted over the wire:
+
+```
+[Browser Client]                                              [FastAPI Gateway]
+       │                                                             │
+       │─── 1. GET /api/v1/auth/public-key ─────────────────────────►│
+       │◄── Returns RSA-2048 Public Key PEM (DER-encoded) ───────────│
+       │                                                             │
+       │ [Client encrypts credentials via hybrid RSA+AES-GCM]         │
+       │                                                             │
+       │─── 2. POST /api/v1/auth/secure-login (Encrypted Envelope) ──►│
+       │                                                             │ (Unwraps AES key with server private key)
+       │                                                             │ (Decrypts credential payload)
+       │                                                             │ (Validates against Argon2id/bcrypt hash)
+       │◄── Issues Tenant-Scoped JWT (role: user/developer/admin) ───│
+```
+
+### Role-Based Access Control (RBAC)
+
+Accounts belong to one of three roles:
+1. `user`: Standard access to personal document workspace, search, redline compare, and grounded chat.
+2. `developer`: Unlocks the **Developer Audit & Observability Console** (`/api/v1/telemetry/*`), allowing inspection of error logs, p95 latency, and system health metrics.
+3. `admin`: Unrestricted administrative oversight across tenants and system telemetry.
+
+### Promoting Users via Developer CLI
+
+Promote an existing user to developer or admin securely without manual SQL scripts:
+
+```bash
+# Promote user to developer role
+.venv/bin/python -m app.cli promote-user --email "developer@cognifolio.ai" --role developer
+
+# Promote user to admin role
+.venv/bin/python -m app.cli promote-user --email "admin@cognifolio.ai" --role admin
+```
+
+---
+
+## 8. Centralized Error Telemetry & Observability Engine (Supabase PostgreSQL)
+
+Enterprise resilience requires complete visibility into runtime anomalies without leaking raw stack traces to end users.
+
+### Telemetry Architecture (`public.error_logs`)
+
+All client-side exceptions and backend service failures write structured records to the dedicated `public.error_logs` table in Supabase PostgreSQL:
+
+```sql
+CREATE TABLE IF NOT EXISTS public.error_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    correlation_id VARCHAR(32) NOT NULL UNIQUE,
+    user_id UUID REFERENCES public.users(id) ON DELETE SET NULL,
+    user_email VARCHAR(255),
+    severity VARCHAR(16) NOT NULL DEFAULT 'ERROR',
+    error_code VARCHAR(64) NOT NULL,
+    subsystem VARCHAR(64) NOT NULL,
+    user_friendly_message TEXT NOT NULL,
+    technical_message TEXT,
+    stack_trace TEXT,
+    client_context JSONB DEFAULT '{}'::jsonb,
+    request_payload JSONB DEFAULT '{}'::jsonb,
+    status_code INTEGER,
+    http_method VARCHAR(16),
+    endpoint VARCHAR(255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### Forensic Features
+- **Correlation IDs (`ERR-XXXX-XXXX`)**: Every error event generates a unique, human-readable reference code returned to the frontend toast alert, enabling 1-click issue reporting.
+- **Subsystem Breakdown**: Classifies incidents across `auth`, `ai-extraction`, `gcs-storage`, `vector-qdrant`, `database`, and `client-runtime`.
+- **Latency & Error Aggregations (`GET /api/v1/telemetry/stats`)**: Delivers real-time health metrics (Error Rate %, P95 Latency ms, Total Events, Active Incidents) consumed by the Developer Audit Modal.
+- **Direct SQL Forensic Query**: Each incident in the Developer Console includes a copyable Supabase SQL query for immediate database inspection:
+  ```sql
+  SELECT * FROM public.error_logs WHERE correlation_id = 'ERR-XXXX-XXXX';
+  ```
+
+---
+
+## 9. Supported Multi-Format Ingestion
 
 Cognifolio provides dedicated parsing pipelines across 12+ enterprise formats:
 
@@ -228,7 +310,7 @@ Cognifolio provides dedicated parsing pipelines across 12+ enterprise formats:
 
 ---
 
-## 8. Configuration & Environment Variables
+## 10. Configuration & Environment Variables
 
 Copy `.env.example` to `.env` in the `cognifolio-api` root:
 
@@ -258,7 +340,7 @@ cp .env.example .env
 
 ---
 
-## 9. Installation, Setup & Verification
+## 11. Installation, Setup & Verification
 
 ### 1. Prerequisites
 - **Python**: 3.10+ (Python 3.11 or 3.12 recommended)
@@ -327,7 +409,7 @@ Expected health response:
 
 ---
 
-## 10. API Reference Overview
+## 12. API Reference Overview
 
 All API endpoints are mounted under `/api/v1` and require `Authorization: Bearer <token>` (or `?token=<jwt>` for document streaming in browser viewports):
 
@@ -335,6 +417,17 @@ All API endpoints are mounted under `/api/v1` and require `Authorization: Bearer
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `GET` | `/api/v1/health` | Real-time health diagnostic verifying database, Gemini model, Qdrant, and GCS connectivity. |
+
+### Authentication & Zero-Knowledge Security
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/v1/auth/public-key` | Advertises server's RSA-2048 public key PEM for client-side envelope encryption. |
+| `POST` | `/api/v1/auth/secure-login` | Authenticates user via hybrid RSA+AES encrypted credential envelope. |
+| `POST` | `/api/v1/auth/secure-register` | Registers new tenant account via hybrid encrypted envelope. |
+| `POST` | `/api/v1/auth/guest` | Issues a transient guest JWT allowing friction-free exploration. |
+| `POST` | `/api/v1/auth/login` | Standard fallback login endpoint with Argon2id hash verification. |
+| `POST` | `/api/v1/auth/register` | Standard registration endpoint creating tenant vault. |
+| `GET` | `/api/v1/auth/me` | Retrieves authenticated user profile, role (`user`/`developer`/`admin`), and active plan. |
 
 ### Document Ingestion & Management
 | Method | Endpoint | Description |
@@ -356,11 +449,20 @@ All API endpoints are mounted under `/api/v1` and require `Authorization: Bearer
 | `GET` | `/api/v1/dashboard/stats` | Aggregated executive metrics: spend breakdown, document distribution, compliance scores. |
 | `GET` | `/api/v1/compliance/audit-logs` | Immutable audit log trail showing all user actions with cryptographic timestamps. |
 
+### Observability & Error Telemetry
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/api/v1/telemetry/errors` | Ingests client and gateway error events, persisting structured records to `public.error_logs`. |
+| `GET` | `/api/v1/telemetry/errors` | Paginated, filterable error log stream for developer audit (RBAC: developer/admin). |
+| `GET` | `/api/v1/telemetry/errors/{cid}` | Deep technical inspection of a single incident by correlation ID. |
+| `GET` | `/api/v1/telemetry/stats` | Aggregated system health metrics: error rate, P95 latency, total incidents. |
+
 ---
 
-## 11. Security, Regulatory & Deployment Guidelines
+## 13. Security, Regulatory & Deployment Guidelines
 
 1. **Secret & Key Isolation**: Never commit `gcp-credentials.json`, `*.pem`, or `.env` files to git. Use environment variables or cloud secret managers in staging and production.
 2. **Mandatory Pre-AI Redaction**: Always route new document types or raw text inputs through `PIIRedactor` prior to invoking external AI services.
 3. **Multi-Tenant Scoping**: Ensure every new router endpoint enforces `current_user.id` tenancy checks to prevent cross-account data leakage.
-4. **Git Approval Mandate**: In accordance with project policy, automated scripts or AI assistants must never execute `git commit` or `git push` without explicit developer review and authorization.
+4. **Mandatory Default Error Handling**: Whenever new code, service logic, background workers, or API endpoints are implemented, comprehensive error handling MUST be implemented by default (specific exception scoping, transaction rollback via `db.rollback()` on failure, structured telemetry logging, and resource cleanup via context managers or `finally` blocks).
+5. **Git Approval Mandate**: In accordance with project policy, automated scripts or AI assistants must never execute `git commit` or `git push` without explicit developer review and authorization.

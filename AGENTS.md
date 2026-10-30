@@ -107,6 +107,13 @@ Never re-introduce hardcoded `ext != "pdf"` restrictions in upload routes.
          detail=f"Unsupported format '.{ext}'. Supported: {settings.ALLOWED_EXTENSIONS}"
      )
      ```
+4. **Mandatory Default Error Handling on All Logic & Endpoints**:
+   - **Whenever new code, service logic, background workers, or API endpoints are implemented, comprehensive error handling MUST be implemented by default.**
+   - **Granular Exception Scoping**: Always catch specific exceptions (e.g., `SQLAlchemyError`, `KeyError`, `ValueError`, `FileNotFoundError`, `HTTPException`) before generic `Exception`.
+   - **No Silent Failures**: Never write empty `except:` or `pass` blocks that silently swallow failures.
+   - **Database Rollback on Failure**: Any mutating database transaction (`db.commit()`, `db.add()`) must be wrapped with exception handling that calls `db.rollback()` before raising or returning an error to prevent poisoned transaction sessions.
+   - **Telemetry & Error Logging**: All internal 500 exceptions, third-party AI extraction failures, or unrecoverable system faults must be logged with structured context and correlation IDs (via telemetry or logging) for forensic auditability.
+   - **Safe Resource Cleanup**: File handles, temporary disk files, and network connections must be safely released using context managers (`with`) or `finally` blocks.
 
 ---
 
