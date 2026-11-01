@@ -100,10 +100,11 @@ async def upload_document(
     """
     safe_filename = file.filename or "uploaded_document"
     ext = Path(safe_filename).suffix.lower().replace(".", "")
-    if ext not in settings.allowed_extensions_list:
+    allowed = settings.allowed_extensions_list
+    if ext not in allowed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file format '{ext}'. Allowed: {settings.ALLOWED_EXTENSIONS}",
+            detail=f"Unsupported file format '{ext}'. Allowed: {settings.allowed_extensions_display}",
         )
 
     doc_id = str(uuid.uuid4())
@@ -634,6 +635,10 @@ def get_redacted_document_file(
         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     elif redacted_ext == ".doc":
         media_type = "application/msword"
+    elif redacted_ext in [".xlsx", ".xls"]:
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif redacted_ext == ".csv":
+        media_type = "text/csv; charset=utf-8"
     elif redacted_ext in [".png", ".jpg", ".jpeg", ".webp"]:
         media_type = f"image/{redacted_ext.replace('.', '')}"
     elif redacted_ext in [".txt", ".md"]:

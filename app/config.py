@@ -43,7 +43,30 @@ class Settings(BaseSettings):
 
     @property
     def allowed_extensions_list(self) -> list[str]:
-        return [ext.strip().lower() for ext in self.ALLOWED_EXTENSIONS.split(",")]
+        # Guarantees core enterprise multi-format support even if an environment
+        # variable (e.g. from Render or legacy docker env) passed an incomplete list.
+        parsed = [ext.strip().lower() for ext in self.ALLOWED_EXTENSIONS.split(",") if ext.strip()]
+        return sorted(list(set(CORE_ALLOWED_EXTENSIONS) | set(parsed)))
+
+    @property
+    def allowed_extensions_display(self) -> str:
+        return ", ".join(self.allowed_extensions_list)
+
+
+CORE_ALLOWED_EXTENSIONS: tuple[str, ...] = (
+    "pdf",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "docx",
+    "doc",
+    "xlsx",
+    "xls",
+    "csv",
+    "txt",
+    "md",
+)
 
 
 settings = Settings()

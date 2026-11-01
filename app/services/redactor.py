@@ -203,9 +203,70 @@ class PIIRedactor:
             return {"success": False, "error": str(e)}
 
     @classmethod
+    def redact_xlsx_file(cls, input_xlsx_path: str, output_xlsx_path: str) -> dict:
+        """
+        Applies PII redaction directly to Microsoft Excel (.xlsx) spreadsheets,
+        redacting cell string contents while preserving workbook sheets, formulas, and styles.
+        """
+        try:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(input_xlsx_path)
+            for sheetname in wb.sheetnames:
+                ws = wb[sheetname]
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value and isinstance(cell.value, str):
+                            sanitized, _ = cls.redact(cell.value)
+                            cell.value = sanitized
+            dir_name = os.path.dirname(output_xlsx_path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+            wb.save(output_xlsx_path)
+            wb.close()
+            return {"success": True, "output_path": output_xlsx_path}
+        except Exception as e:
+            try:
+                import shutil
+                shutil.copyfile(input_xlsx_path, output_xlsx_path)
+            except Exception:
+                pass
+            return {"success": False, "error": str(e)}
+
+    @classmethod
+    def redact_csv_file(cls, input_csv_path: str, output_csv_path: str) -> dict:
+        """
+        Applies PII redaction row-by-row to CSV spreadsheets.
+        """
+        try:
+            import csv
+
+            rows = []
+            with open(input_csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    sanitized_row = [cls.redact(cell)[0] for cell in row]
+                    rows.append(sanitized_row)
+
+            dir_name = os.path.dirname(output_csv_path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+            with open(output_csv_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
+            return {"success": True, "output_path": output_csv_path}
+        except Exception as e:
+            try:
+                import shutil
+                shutil.copyfile(input_csv_path, output_csv_path)
+            except Exception:
+                pass
+            return {"success": False, "error": str(e)}
+
+    @classmethod
     def get_or_create_redacted_file(cls, doc_id: str, original_file_path: str) -> str:
         """
-        Returns the path to the redacted file (PDF, Image, Word, or Text), generating it if needed.
+        Returns the path to the redacted file (PDF, Image, Word, Spreadsheet, or Text), generating it if needed.
         """
         directory = os.path.dirname(original_file_path)
         ext = Path(original_file_path).suffix.lower()
@@ -219,6 +280,10 @@ class PIIRedactor:
                 cls.redact_image_file(original_file_path, redacted_path)
             elif ext == ".docx":
                 cls.redact_docx_file(original_file_path, redacted_path)
+            elif ext in [".xlsx", ".xls"]:
+                cls.redact_xlsx_file(original_file_path, redacted_path)
+            elif ext == ".csv":
+                cls.redact_csv_file(original_file_path, redacted_path)
             else:
                 try:
                     with open(original_file_path, encoding="utf-8", errors="ignore") as f:
