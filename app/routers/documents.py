@@ -162,8 +162,13 @@ async def upload_document(
     # Awaiting in parallel hides the 2.5s storage upload behind Gemini inference
     ai_insights, storage_path = await asyncio.gather(gemini_task, storage_task)
 
-    # If image transcription was performed by Gemini, capture it in sanitized_text & index
-    if ai_insights.get("raw_extracted_text"):
+    # For visual images or scans without prior text, capture Gemini's multimodal transcription
+    if is_scanned and ai_insights.get("raw_extracted_text"):
+        gemini_text = str(ai_insights["raw_extracted_text"]).replace("\x00", "")
+        sanitized_text, extra_pii = redactor.redact(gemini_text)
+        for k, v in extra_pii.items():
+            pii_stats[k] = pii_stats.get(k, 0) + v
+    elif not sanitized_text.strip() and ai_insights.get("raw_extracted_text"):
         gemini_text = str(ai_insights["raw_extracted_text"]).replace("\x00", "")
         sanitized_text, extra_pii = redactor.redact(gemini_text)
         for k, v in extra_pii.items():
@@ -444,13 +449,20 @@ async def reanalyze_document(
         is_scanned=is_scanned,
     )
 
-    if ai_insights.get("raw_extracted_text"):
-        gemini_text = ai_insights["raw_extracted_text"]
+    # For visual images or scans without prior text, capture Gemini's multimodal transcription
+    if is_scanned and ai_insights.get("raw_extracted_text"):
+        gemini_text = str(ai_insights["raw_extracted_text"]).replace("\x00", "")
+        sanitized_text, extra_pii = redactor.redact(gemini_text)
+        for k, v in extra_pii.items():
+            pii_stats[k] = pii_stats.get(k, 0) + v
+    elif not sanitized_text.strip() and ai_insights.get("raw_extracted_text"):
+        gemini_text = str(ai_insights["raw_extracted_text"]).replace("\x00", "")
         sanitized_text, extra_pii = redactor.redact(gemini_text)
         for k, v in extra_pii.items():
             pii_stats[k] = pii_stats.get(k, 0) + v
     elif raw_text and raw_text.startswith("[Scanned Image"):
         sanitized_text = ""
+    sanitized_text = sanitized_text.replace("\x00", "")
 
     # 4. Upsert DocumentInsight
     existing_insight = db.query(DocumentInsight).filter(DocumentInsight.document_id == doc.id).first()
@@ -544,15 +556,26 @@ def get_document_file(
         ".pdf": "application/pdf",
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".doc": "application/msword",
+        ".rtf": "application/rtf",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         ".xls": "application/vnd.ms-excel",
         ".csv": "text/csv; charset=utf-8",
+        ".tsv": "text/tab-separated-values; charset=utf-8",
         ".txt": "text/plain; charset=utf-8",
         ".md": "text/markdown; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".xml": "application/xml; charset=utf-8",
+        ".yaml": "text/yaml; charset=utf-8",
+        ".yml": "text/yaml; charset=utf-8",
+        ".log": "text/plain; charset=utf-8",
         ".png": "image/png",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
         ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tiff": "image/tiff",
+        ".svg": "image/svg+xml",
     }
     mime_type = str(doc.mime_type) if doc.mime_type and doc.mime_type != "application/octet-stream" else default_mime_map.get(ext, "application/octet-stream")
 
@@ -635,13 +658,25 @@ def get_redacted_document_file(
         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     elif redacted_ext == ".doc":
         media_type = "application/msword"
+    elif redacted_ext == ".rtf":
+        media_type = "application/rtf"
     elif redacted_ext in [".xlsx", ".xls"]:
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     elif redacted_ext == ".csv":
         media_type = "text/csv; charset=utf-8"
-    elif redacted_ext in [".png", ".jpg", ".jpeg", ".webp"]:
+    elif redacted_ext == ".tsv":
+        media_type = "text/tab-separated-values; charset=utf-8"
+    elif redacted_ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"]:
         media_type = f"image/{redacted_ext.replace('.', '')}"
-    elif redacted_ext in [".txt", ".md"]:
+    elif redacted_ext == ".svg":
+        media_type = "image/svg+xml"
+    elif redacted_ext == ".json":
+        media_type = "application/json; charset=utf-8"
+    elif redacted_ext == ".xml":
+        media_type = "application/xml; charset=utf-8"
+    elif redacted_ext in [".yaml", ".yml"]:
+        media_type = "text/yaml; charset=utf-8"
+    elif redacted_ext in [".txt", ".md", ".log"]:
         media_type = "text/plain; charset=utf-8"
 
     return Response(
