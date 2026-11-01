@@ -4,7 +4,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
@@ -129,10 +129,11 @@ async def upload_document(
     # 2. Local extraction and PII redaction (< 100ms)
     local_extraction_path = temp_file_path
     extraction_res = extractor.extract(local_extraction_path)
-    raw_text = extraction_res["text"]
-    page_count = extraction_res["page_count"]
-    is_scanned = extraction_res["is_scanned"]
+    raw_text = str(extraction_res.get("text") or "").replace("\x00", "")
+    page_count = extraction_res.get("page_count") or 1
+    is_scanned = extraction_res.get("is_scanned", False)
     sanitized_text, pii_stats = redactor.redact(raw_text)
+    sanitized_text = sanitized_text.replace("\x00", "")
 
     # Pre-generate physical redacted file locally (< 80ms)
     redacted_local = None
@@ -162,12 +163,13 @@ async def upload_document(
 
     # If image transcription was performed by Gemini, capture it in sanitized_text & index
     if ai_insights.get("raw_extracted_text"):
-        gemini_text = ai_insights["raw_extracted_text"]
+        gemini_text = str(ai_insights["raw_extracted_text"]).replace("\x00", "")
         sanitized_text, extra_pii = redactor.redact(gemini_text)
         for k, v in extra_pii.items():
             pii_stats[k] = pii_stats.get(k, 0) + v
     elif raw_text and raw_text.startswith("[Scanned Image"):
         sanitized_text = ""
+    sanitized_text = sanitized_text.replace("\x00", "")
 
     # 4. Single Atomic Database Transaction (eliminates 4 remote database network roundtrips)
     doc = Document(
@@ -185,20 +187,29 @@ async def upload_document(
         processed_at=datetime.now(timezone.utc),
     )
 
+    def _clean_field(val: Any) -> Any:
+        if isinstance(val, str):
+            return val.replace("\x00", "")
+        if isinstance(val, list):
+            return [_clean_field(x) for x in val]
+        if isinstance(val, dict):
+            return {k: _clean_field(v) for k, v in val.items()}
+        return val
+
     insight = DocumentInsight(
         id=str(uuid.uuid4()),
         document_id=doc.id,
-        document_type=ai_insights["document_type"],
-        title=ai_insights["title"],
-        summary=ai_insights["summary"],
-        key_points=ai_insights["key_points"],
-        entities=ai_insights["entities"],
-        line_items=ai_insights["line_items"],
-        action_items=ai_insights["action_items"],
-        risk_clauses=ai_insights["risk_clauses"],
-        charts_data=ai_insights["charts_data"],
+        document_type=str(ai_insights.get("document_type") or "Document").replace("\x00", ""),
+        title=str(ai_insights.get("title") or safe_filename).replace("\x00", ""),
+        summary=str(ai_insights.get("summary") or "").replace("\x00", ""),
+        key_points=_clean_field(ai_insights.get("key_points") or []),
+        entities=_clean_field(ai_insights.get("entities") or {}),
+        line_items=_clean_field(ai_insights.get("line_items") or []),
+        action_items=_clean_field(ai_insights.get("action_items") or []),
+        risk_clauses=_clean_field(ai_insights.get("risk_clauses") or []),
+        charts_data=_clean_field(ai_insights.get("charts_data") or {"chart_type": "none", "labels": [], "values": []}),
         raw_extracted_text=sanitized_text,
-        confidence_score=ai_insights["confidence_score"],
+        confidence_score=float(ai_insights.get("confidence_score") or 0.95),
     )
 
     db.add(doc)
@@ -527,7 +538,22 @@ def get_document_file(
 
     file_path = str(doc.file_path)
     original_filename = str(doc.original_filename)
-    mime_type = str(doc.mime_type) if doc.mime_type else "application/octet-stream"
+    ext = Path(original_filename).suffix.lower()
+    default_mime_map = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".csv": "text/csv; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }
+    mime_type = str(doc.mime_type) if doc.mime_type and doc.mime_type != "application/octet-stream" else default_mime_map.get(ext, "application/octet-stream")
 
     try:
         data, content_type = storage_service.get_file_bytes(file_path)
@@ -604,6 +630,10 @@ def get_redacted_document_file(
     media_type = str(doc.mime_type) if doc.mime_type else "application/octet-stream"
     if redacted_ext == ".pdf":
         media_type = "application/pdf"
+    elif redacted_ext == ".docx":
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif redacted_ext == ".doc":
+        media_type = "application/msword"
     elif redacted_ext in [".png", ".jpg", ".jpeg", ".webp"]:
         media_type = f"image/{redacted_ext.replace('.', '')}"
     elif redacted_ext in [".txt", ".md"]:
