@@ -8,7 +8,7 @@ This document specifies the architectural conventions, security mandates, depend
 
 - **Framework**: [FastAPI](https://fastapi.tiangolo.com/) with async endpoint handlers, Pydantic v2 schemas, and dependency injection (`Depends`).
 - **ORM & Database**: [SQLAlchemy 2.0](https://www.sqlalchemy.org/) with typed `Mapped` annotations.
-  - Local / Testing: SQLite (`docstudio.db`).
+  - Local / Testing: SQLite (`cognifolio.db`).
   - Production: Supabase PostgreSQL 17 via `DATABASE_URL`.
 - **Multimodal AI Extraction**: [Google Gemini 2.5 Flash / 3.5 Flash](https://ai.google.dev/) via the modern `google.genai` SDK.
 - **Vector Database**: [Qdrant Cloud](https://qdrant.tech/) with 768-D dense embeddings (`gemini-embedding-001`).
