@@ -276,13 +276,13 @@ class PIIRedactor:
         if not os.path.exists(redacted_path):
             if ext == ".pdf":
                 cls.redact_pdf_file(original_file_path, redacted_path)
-            elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
+            elif ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"]:
                 cls.redact_image_file(original_file_path, redacted_path)
             elif ext == ".docx":
                 cls.redact_docx_file(original_file_path, redacted_path)
             elif ext in [".xlsx", ".xls"]:
                 cls.redact_xlsx_file(original_file_path, redacted_path)
-            elif ext == ".csv":
+            elif ext in [".csv", ".tsv"]:
                 cls.redact_csv_file(original_file_path, redacted_path)
             else:
                 try:

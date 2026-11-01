@@ -39,12 +39,14 @@ class DocumentExtractor:
 
         if ext == ".pdf":
             res = cls._extract_pdf(file_path)
-        elif ext in [".docx", ".doc"]:
+        elif ext in [".docx", ".doc", ".rtf"]:
             res = cls._extract_word(file_path)
-        elif ext in [".xlsx", ".xls", ".csv"]:
+        elif ext in [".xlsx", ".xls", ".csv", ".tsv"]:
             res = cls._extract_spreadsheet(file_path)
-        elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
+        elif ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"]:
             res = cls._extract_image(file_path)
+        elif ext == ".svg":
+            res = cls._extract_svg(file_path)
         else:
             res = cls._extract_text(file_path)
 
@@ -349,13 +351,15 @@ class DocumentExtractor:
     @classmethod
     def _extract_spreadsheet(cls, file_path: str) -> dict:
         ext = Path(file_path).suffix.lower()
-        if ext == ".csv":
+        if ext in [".csv", ".tsv"]:
             return cls._extract_csv(file_path)
+        if ext == ".xls":
+            return cls._extract_xls(file_path)
 
         try:
             import openpyxl
 
-            wb = openpyxl.load_workbook(file_path, data_only=True)
+            wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
             sheets_text = []
             full_text_lines = []
             sheets_data = {}
@@ -364,28 +368,44 @@ class DocumentExtractor:
                 ws = wb[sheet_name]
                 sheet_lines = [f"--- [Sheet: {sheet_name}] ---"]
                 rows_data = []
+                consecutive_empty = 0
 
                 for row in ws.iter_rows(values_only=True):
                     if not any(v is not None and str(v).strip() != "" for v in row):
+                        consecutive_empty += 1
+                        if consecutive_empty >= 100:
+                            # Avoid spinning on empty trailing rows up to 1,048,576
+                            break
                         continue
-                    row_strs = [str(v).strip() if v is not None else "" for v in row]
+                    consecutive_empty = 0
+
+                    row_strs = [
+                        str(v).replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("|", "/").strip()
+                        if v is not None
+                        else ""
+                        for v in row
+                    ]
                     rows_data.append(row_strs)
 
                 if rows_data:
-                    header = rows_data[0]
+                    max_cols = max(len(r) for r in rows_data)
+                    header = list(rows_data[0])
+                    if len(header) < max_cols:
+                        header = header + [f"Column {i + 1}" for i in range(len(header), max_cols)]
                     sheet_lines.append("| " + " | ".join(header) + " |")
                     sheet_lines.append("| " + " | ".join(["---"] * len(header)) + " |")
-                    for row in rows_data[1:100]:
-                        sheet_lines.append("| " + " | ".join(row) + " |")
-                    if len(rows_data) > 100:
-                        sheet_lines.append(
-                            f"\n*(Truncated: {len(rows_data)} total rows in sheet '{sheet_name}')*"
-                        )
+                    for row in rows_data[1:]:
+                        norm_row = list(row)
+                        if len(norm_row) < len(header):
+                            norm_row = norm_row + [""] * (len(header) - len(norm_row))
+                        elif len(norm_row) > len(header):
+                            norm_row = norm_row[:len(header)]
+                        sheet_lines.append("| " + " | ".join(norm_row) + " |")
 
                 sheet_content = "\n".join(sheet_lines)
                 sheets_text.append(sheet_content)
                 full_text_lines.append(sheet_content)
-                sheets_data[sheet_name] = rows_data[:200]
+                sheets_data[sheet_name] = rows_data
 
             wb.close()
             combined_text = "\n\n".join(full_text_lines).strip()
@@ -401,23 +421,107 @@ class DocumentExtractor:
             return cls._extract_text(file_path, fallback_error=str(e))
 
     @classmethod
+    def _extract_xls(cls, file_path: str) -> dict:
+        """
+        Extraction engine for legacy Microsoft Excel 97-2003 binary spreadsheets (.xls) via xlrd.
+        """
+        try:
+            import xlrd
+
+            book = xlrd.open_workbook(file_path)
+            sheets_text = []
+            full_text_lines = []
+            sheets_data = {}
+
+            for sheet_name in book.sheet_names():
+                sheet = book.sheet_by_name(sheet_name)
+                sheet_lines = [f"--- [Sheet: {sheet_name}] ---"]
+                rows_data = []
+
+                for row_idx in range(sheet.nrows):
+                    row = sheet.row_values(row_idx)
+                    if not any(v is not None and str(v).strip() != "" for v in row):
+                        continue
+                    row_strs = [
+                        str(v).replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("|", "/").strip()
+                        if v is not None
+                        else ""
+                        for v in row
+                    ]
+                    rows_data.append(row_strs)
+
+                if rows_data:
+                    max_cols = max(len(r) for r in rows_data)
+                    header = list(rows_data[0])
+                    if len(header) < max_cols:
+                        header = header + [f"Column {i + 1}" for i in range(len(header), max_cols)]
+                    sheet_lines.append("| " + " | ".join(header) + " |")
+                    sheet_lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+                    for row in rows_data[1:]:
+                        norm_row = list(row)
+                        if len(norm_row) < len(header):
+                            norm_row = norm_row + [""] * (len(header) - len(norm_row))
+                        elif len(norm_row) > len(header):
+                            norm_row = norm_row[:len(header)]
+                        sheet_lines.append("| " + " | ".join(norm_row) + " |")
+
+                sheet_content = "\n".join(sheet_lines)
+                sheets_text.append(sheet_content)
+                full_text_lines.append(sheet_content)
+                sheets_data[sheet_name] = rows_data
+
+            combined_text = "\n\n".join(full_text_lines).strip()
+            return {
+                "text": combined_text,
+                "page_count": max(1, len(book.sheet_names())),
+                "is_scanned": False,
+                "pages": sheets_text,
+                "sheets": sheets_data,
+                "format": "xls",
+            }
+        except Exception as e:
+            return cls._extract_text(file_path, fallback_error=str(e))
+
+    @classmethod
     def _extract_csv(cls, file_path: str) -> dict:
         try:
             rows = []
+            ext = Path(file_path).suffix.lower()
             with open(file_path, encoding="utf-8", errors="ignore") as f:
-                reader = csv.reader(f)
+                sample = f.read(4096)
+                f.seek(0)
+                delimiter = ","
+                if ext == ".tsv" or "\t" in sample:
+                    delimiter = "\t"
+                elif ";" in sample and "," not in sample:
+                    delimiter = ";"
+                elif "|" in sample and "," not in sample:
+                    delimiter = "|"
+                reader = csv.reader(f, delimiter=delimiter)
                 for row in reader:
                     if any(cell.strip() for cell in row):
-                        rows.append(row)
+                        clean_row = [
+                            cell.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("|", "/").strip()
+                            for cell in row
+                        ]
+                        rows.append(clean_row)
 
-            lines = ["--- [CSV Spreadsheet] ---"]
+            fmt_name = "tsv" if ext == ".tsv" else "csv"
+            lines = [f"--- [{fmt_name.upper()} Spreadsheet] ---"]
             if rows:
-                lines.append("| " + " | ".join(rows[0]) + " |")
-                lines.append("| " + " | ".join(["---"] * len(rows[0])) + " |")
-                for row in rows[1:150]:
-                    lines.append("| " + " | ".join(row) + " |")
-                if len(rows) > 150:
-                    lines.append(f"\n*(Truncated: {len(rows)} total rows in CSV)*")
+                max_cols = max(len(r) for r in rows)
+                header = list(rows[0])
+                if len(header) < max_cols:
+                    header = header + [f"Column {i + 1}" for i in range(len(header), max_cols)]
+                lines.append("| " + " | ".join(header) + " |")
+                lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+                for row in rows[1:]:
+                    norm_row = list(row)
+                    if len(norm_row) < len(header):
+                        norm_row = norm_row + [""] * (len(header) - len(norm_row))
+                    elif len(norm_row) > len(header):
+                        norm_row = norm_row[:len(header)]
+                    lines.append("| " + " | ".join(norm_row) + " |")
 
             text = "\n".join(lines)
             return {
@@ -425,8 +529,24 @@ class DocumentExtractor:
                 "page_count": 1,
                 "is_scanned": False,
                 "pages": [text],
-                "sheets": {"CSV Data": rows[:200]},
-                "format": "csv",
+                "sheets": {f"{fmt_name.upper()} Data": rows},
+                "format": fmt_name,
+            }
+        except Exception as e:
+            return cls._extract_text(file_path, fallback_error=str(e))
+
+    @classmethod
+    def _extract_svg(cls, file_path: str) -> dict:
+        try:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            clean_xml = cls._clean_text(content)
+            return {
+                "text": f"[Vector Graphic SVG: {Path(file_path).name}]\n\n{clean_xml[:5000]}",
+                "page_count": 1,
+                "is_scanned": False,
+                "pages": [clean_xml],
+                "format": "svg",
             }
         except Exception as e:
             return cls._extract_text(file_path, fallback_error=str(e))
